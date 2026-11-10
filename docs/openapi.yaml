@@ -1,0 +1,3809 @@
+openapi: 3.0.3
+info:
+  title: UrbanMove Cargo-Bike Sharing API
+  version: 1.0.0
+  description: |
+    API contract for **UrbanMove**, the city's network of electrically assisted cargo bikes at mobility hubs.
+    Consumers: the customer web/mobile app, the hub-operator app and the internal operations dashboard.
+
+    This document is the complete submission: endpoint catalogue (see operations below), conventions,
+    the five workflows, lifecycle tables, example responses, assumptions and key design decisions.
+
+    ---
+
+    # 1. Conventions
+
+    ## Versioning
+    * Major version in the path: `/v1/...`. Additive, backwards-compatible changes (new optional fields,
+      new endpoints, new enum values flagged as *extensible*) do **not** change the version.
+    * Breaking changes ship as `/v2` alongside `/v1`. A retiring version returns `Deprecation` and
+      `Sunset` headers for at least 6 months before removal.
+    * Clients must ignore unknown response fields.
+
+    ## Media types
+    | Media type | Used for | Why |
+    |---|---|---|
+    | `application/json` | all request and response bodies | default |
+    | `application/problem+json` | all error responses | RFC 9457 (formerly 7807) standard error format |
+    | `multipart/form-data` | `POST /v1/attachments` (photos of damage/faults) | binary upload; JSON+base64 would inflate size by ~33 % |
+    | `application/pdf` | `GET /v1/invoices/{id}` with `Accept: application/pdf` | legally required printable rendition of the *same* resource (content negotiation, not a separate endpoint) |
+
+    ## Data formats
+    * Timestamps: ISO-8601 UTC (`2026-11-20T09:00:00Z`). Recurring requests use local wall-clock time plus an IANA `time_zone`.
+    * Money: integer minor units (`amount_minor: 2250` = EUR 22.50) plus an ISO-4217 `currency`.
+    * IDs are opaque strings with a type prefix (`RES-`, `RNT-`, `INV-`...). Clients must not parse them.
+
+    ## Pagination and filtering
+    All collection `GET`s are cursor-paginated: `?limit=` (1–100, default 20) and `?cursor=`. Responses have
+    `{ "items": [...], "next_cursor": "..." | null }` and a `Link: <...>; rel="next"` header.
+    Cursor pagination is stable while new reservations are inserted (offset pagination is not).
+
+    ## Authentication and roles
+    OAuth 2.0 / OIDC bearer JWT issued by the city identity provider. Relevant claims:
+    `sub` (user id), `roles[]`, `organisation_id` (organisation members), `assigned_hub_ids[]` (hub operators).
+
+    | Role (`roles` claim) | Capability summary |
+    |---|---|
+    | `RESIDENT` | own profile, availability search, own reservations / rentals / invoices / disputes |
+    | `ORG_MEMBER` | everything `RESIDENT` can + create/view reservation requests of **their** organisation, act on that organisation's reservations |
+    | `HUB_OPERATOR` | checkout / check-in / condition reports / operator queue **only at `assigned_hub_ids`**; may report faults |
+    | `OPS_COORDINATOR` | approve/reject organisation requests, operational blocks, service outages, hub & fleet management |
+    | `TECHNICIAN` | faults and maintenance windows; read bikes. **No** access to reservations, invoices or charges |
+    | `SUPPORT_AGENT` | read invoices/disputes/reservations of any customer, resolve disputes, issue credit notes |
+
+    **No system-administrator role is introduced.** User provisioning, role assignment and operator-hub
+    assignment happen in the city identity provider; hub and fleet management is already a coordinator
+    capability. No API capability remains that would justify a separate role.
+
+    Every operation lists its allowed roles in its description and in the `x-roles` extension.
+
+    ## Error model
+    All errors use `application/problem+json` (schema `Problem`). `code` is a stable, machine-readable
+    identifier that clients switch on. `title`/`detail` are human-readable and may change.
+
+    | Status | Meaning in this API |
+    |---|---|
+    | 400 `VALIDATION_FAILED` | malformed JSON or schema violation; `errors[]` lists the fields |
+    | 401 `UNAUTHENTICATED` | missing/expired token |
+    | 403 | the role lacks the capability (`ROLE_NOT_PERMITTED`) or the operator is not assigned to the hub (`HUB_NOT_ASSIGNED`) |
+    | 404 `NOT_FOUND` | resource does not exist **or the caller may not know it exists** (another resident's invoice) |
+    | 409 | request conflicts with *current state*: overlap/double booking, invalid state transition, reservation limit, idempotency key still being processed |
+    | 412 `ETAG_MISMATCH` | `If-Match` is stale (optimistic concurrency) |
+    | 422 | well-formed but violates a business rule independent of concurrent state (bike does not meet requirements, end before start, idempotency key reused with a different body) |
+    | 428 `IF_MATCH_REQUIRED` | `PATCH` without `If-Match` |
+    | 429 `RATE_LIMITED` | with `Retry-After` |
+
+    ## Idempotency (safe retries)
+    Every `POST` that creates something or performs a state transition **requires** an `Idempotency-Key`
+    header (UUID v4, generated by the client once per *user intent*, reused on every retry of that intent).
+    * The server stores `(key, caller sub, endpoint)` with a hash of the body and the final response for **24 h**.
+    * Same key + same body → the stored response is replayed (same status, same body) with `Idempotent-Replayed: true`. No second execution.
+    * Same key + different body → `422 IDEMPOTENCY_KEY_REUSED`.
+    * Same key while the first request is still running → `409 IDEMPOTENCY_IN_PROGRESS` with `Retry-After: 1`.
+    * 2xx and 4xx business outcomes are stored; 5xx responses are not (retrying actually retries).
+
+    ## Optimistic concurrency
+    Mutable master data (hubs, bikes, equipment, profile, reservation-request amendments) return an `ETag`.
+    `PATCH` requires `If-Match`, so two coordinators cannot overwrite each other silently.
+
+    ## Resources, actions and views
+    * **Resources** (nouns, CRUD-like): hubs, bikes, equipment, reservations, rentals, condition reports,
+      faults, maintenance windows, operational blocks, service outages, reservation requests (+ occurrences),
+      invoices, credit notes, disputes, attachments.
+    * **State transitions** with side effects are modelled as `POST /{collection}/{id}/{action}`
+      (`/cancel`, `/checkin`, `/approve`, `/reject`, `/resolve`, `/start-work`, `/start-review`, `/withdraw`, `/complete`).
+      Rationale: each one has its own permission rule, its own request body (e.g. `service_outage_id`,
+      condition report), its own side effects (fees, invoices, displacement) and must be idempotent via
+      `Idempotency-Key`. A generic `PATCH {status: ...}` could not express that and would invite invalid transitions.
+      `POST` is used (not `PATCH`) because the call is not a partial update of the representation.
+    * Where the result of an action is a **new thing with its own identity**, it is a resource creation instead:
+      checkout = `POST /v1/rentals`, extension = `POST /v1/rentals/{id}/extensions`,
+      partial credit = a `CreditNote` created by the dispute resolution, condition report = `ConditionReport`.
+    * **Views** (read-only, computed, never stored): `GET /v1/availability/hub-summaries` (map),
+      `GET /v1/availability/bikes` (eligible bike search), `GET /v1/hubs/{id}/operator-queue`,
+      `GET /v1/reservation-requests/{id}/feasibility`. They are `GET` on nouns describing the view so they are cacheable.
+
+    ---
+
+    # 2. Key design decisions
+
+    1. **Reservation ≠ Rental.** A reservation is a time-bound *promise* created by a customer; a rental is
+       *physical custody* started by an operator with an identity check and a condition report. Rentals can
+       exist without reservations (walk-in), can be extended and returned late; reservations can expire.
+       Separate resources give separate permissions, lifecycles and audit trails.
+    2. **One allocation ledger, enforced by the database.** Reservations, rentals, maintenance windows and
+       operational blocks all write *allocations* `(asset_id, time range)` into one table with an exclusion
+       constraint (no overlapping ranges per bike or equipment item). Creating a reservation inserts the bike
+       and all equipment allocations in one transaction: all or nothing. Concurrent winners/losers are
+       decided by the database, never by a check-then-insert in application code → no double bookings, `409` for the loser.
+    3. **Financial documents are immutable.** `Invoice` and `CreditNote` have no `PATCH`/`DELETE`.
+       Corrections are new credit notes (partial) or a full credit note plus a replacement invoice
+       (`replaces_invoice_id`). The invoice representation shows linked credit notes and a *derived* `net_amount_minor`.
+
+    ### A choice that looked RESTful but was rejected
+    `PATCH /v1/reservations/{id}` with `{"status": "CANCELLED"}` (or `DELETE /v1/reservations/{id}`).
+    It looks like textbook REST, but cancellation is not a field edit: it requires a reason, may require a
+    documented `service_outage_id`, may issue a fee invoice, must be idempotent, and is only valid from
+    `CONFIRMED`. `DELETE` also implies the resource disappears, while we must keep it for audit and billing.
+    We use `POST /v1/reservations/{id}/cancel` and the reservation remains readable as `CANCELLED`.
+
+    ### Trade-off: convenient client API vs business invariants
+    *Convenient:* the availability search could put a soft hold on the bike, so "Reserve" never fails,
+    and reservations could be edited in place (`PATCH` start/end/bike).
+    *Chosen:* search results are a **non-binding snapshot**; only `POST /v1/reservations` is atomic, and
+    clients must handle `409` (re-search and retry). Reservations cannot be re-timed; the client cancels and creates a new one
+    (free if > 24 h before start). Soft holds would let a client block the last bike without booking, and
+    in-place edits would need the same overlap check, fee rules and limit check as cancel+create, plus extra edge cases.
+    The app hides this by offering the next-best bike from the `409` body (`alternatives_href`).
+
+    ---
+
+    # 3. Assumptions
+
+    1. The JWT is trusted; `assigned_hub_ids` reflects current assignments (short token lifetime, 15 min).
+    2. "Active reservation" = status `CONFIRMED`. Reservations created from an **organisation** request belong
+       to the organisation account and do **not** count toward a member's personal limit of two.
+    3. A bike is bookable for a period only if: no open `CRITICAL` fault, no overlapping maintenance window,
+       operational block, reservation or rental, not retired, current `battery_pct ≥ 30` (network minimum) **and**
+       estimated range ≥ the requested `min_range_km`. Bikes below the minimum are shown in the operator queue as "needs charging".
+    4. Reservation slots are between 30 min and 8 h, start at least 10 min in the future and at most 60 days ahead.
+    5. A reservation is "collected" when the checkout (`POST /v1/rentals`) happens. If not collected by
+       `start + 15 min`, the system expires it; expiry is charged like a late cancellation (no-show fee).
+    6. Late cancellation (< 24 h before start) is free only with a `service_outage_id` that covers the reservation's
+       hub/bike and time. Outages are created by coordinators; a critical fault on a reserved bike that cannot be
+       substituted automatically creates such an outage record.
+    7. Pricing (illustrative values used in examples): EUR 2.50 per started 30 min; child seat EUR 3.00 and rain cover
+       EUR 2.00 flat per rental; late fee EUR 5.00 per started 30 min after `due_at`; different-hub return fee EUR 8.00
+       (configurable per hub pair, may be 0). Prices include VAT. Cancellation/no-show fee EUR 5.00.
+    8. Equipment damage is **not** priced at check-in. Damaged/missing items are flagged; if a damage charge is
+       later decided, it is issued as a **separate** invoice (`source.type = DAMAGE_ASSESSMENT`).
+    9. Check-in time is the server time of the check-in request, not a client-supplied value.
+    10. Equipment returned at another hub now belongs to the return hub (like the bike); coordinators rebalance.
+    11. Disputes can be opened within 60 days of invoice issue, one open dispute per invoice line item.
+    12. Payment collection is handled by an external payment provider; payment status is outside this contract.
+    13. If a maintenance window or block is created over existing reservations, technicians get `409` (they cannot
+        change reservations); a coordinator may pass `displacement: REASSIGN_OR_CANCEL`: the system moves each reservation
+        to an equivalent eligible bike, or cancels it free of charge with reason `OPERATIONAL_DISPLACEMENT` and notifies the customer.
+
+    ---
+
+    # 4. Workflows
+
+    ## W1 – Resident finds an eligible bike and reserves it with two pieces of equipment
+    ```
+    GET /v1/availability/bikes?hub_id=HUB-01&start=2026-11-20T09:00:00Z&end=2026-11-20T12:00:00Z
+        &min_load_capacity_kg=80&accessibility_features=STEP_THROUGH_FRAME&min_range_km=30
+        &equipment_types=CHILD_SEAT,RAIN_COVER
+    → 200 OK   Cache-Control: no-store
+    { "hub_id":"HUB-01", ..., "bikes":[{"bike_id":"BIKE-402","load_capacity_kg":120,"battery_pct":92,...}],
+      "equipment":[{"equipment_id":"EQ-CHILD-01","equipment_type":"CHILD_SEAT"},
+                   {"equipment_id":"EQ-RAIN-02","equipment_type":"RAIN_COVER"}],
+      "is_binding": false }
+    ```
+    Only bikes that satisfy **every** rule for the **whole** period are returned (fault/maintenance/block/battery/
+    overlap/requirements). A bike parked at HUB-01 but with a critical fault is simply absent.
+    ```
+    POST /v1/reservations
+    Idempotency-Key: 3f1c2a8e-7c11-4a55-9a8e-2b8f0c6d1e01
+    { "bike_id":"BIKE-402","pickup_hub_id":"HUB-01","planned_return_hub_id":"HUB-01",
+      "start":"2026-11-20T09:00:00Z","end":"2026-11-20T12:00:00Z",
+      "equipment_ids":["EQ-CHILD-01","EQ-RAIN-02"],
+      "requirements":{"min_load_capacity_kg":80,"accessibility_features":["STEP_THROUGH_FRAME"],"min_range_km":30} }
+    → 201 Created   Location: /v1/reservations/RES-9901   ETag: "1"
+    { "reservation_id":"RES-9901","status":"CONFIRMED","collect_by":"2026-11-20T09:15:00Z",
+      "free_cancellation_until":"2026-11-19T09:00:00Z", ... }
+    ```
+    State after: reservation `CONFIRMED`; allocations for BIKE-402, EQ-CHILD-01, EQ-RAIN-02 on [09:00, 12:00).
+
+    Error paths:
+    * already 2 `CONFIRMED` reservations → `409 RESERVATION_LIMIT_REACHED`
+    * bike or an equipment item taken meanwhile → `409 ASSET_UNAVAILABLE` (nothing is allocated; all or nothing)
+    * bike does not meet `requirements` / battery below minimum / open critical fault → `422 BIKE_NOT_ELIGIBLE`
+    * equipment at another hub than `pickup_hub_id` → `422 EQUIPMENT_NOT_AT_HUB`
+    * `end ≤ start`, start in the past → `400 VALIDATION_FAILED`; unknown bike → `404`; technician token → `403 ROLE_NOT_PERMITTED`
+
+    ## W2 – Operator checks out the bike, then it is checked in late at another hub with a damaged rain cover
+    **Checkout** by operator OP-11 (`assigned_hub_ids: ["HUB-01"]`) at 09:05:
+    ```
+    POST /v1/rentals
+    Idempotency-Key: 9a0e...
+    { "reservation_id":"RES-9901","hub_id":"HUB-01",
+      "identity_check":{"method":"ID_CARD","verified":true,"document_reference_last4":"4471"},
+      "condition_report":{"battery_pct":95,"bike_condition":"GOOD",
+        "equipment":[{"equipment_id":"EQ-CHILD-01","status":"OK"},{"equipment_id":"EQ-RAIN-02","status":"OK"}]} }
+    → 201 Created   Location: /v1/rentals/RNT-8812
+    { "rental_id":"RNT-8812","status":"ACTIVE","due_at":"2026-11-20T12:00:00Z","condition_report_ids":["CR-1"], ... }
+    ```
+    State after: rental `ACTIVE`; reservation `RES-9901` → `CHECKED_OUT`; CR-1 (kind `CHECKOUT`) stored immutably.
+    Errors: OP-11 not assigned to HUB-01 → `403 HUB_NOT_ASSIGNED`; after 09:15 → `409 RESERVATION_NOT_COLLECTABLE`
+    (status `EXPIRED`); bike got a critical fault → `409 BIKE_NOT_CHECKOUTABLE` (operator may send `bike_id` of an
+    eligible substitute; not eligible → `422 BIKE_NOT_ELIGIBLE`); `identity_check.verified=false` → `422 IDENTITY_NOT_VERIFIED`;
+    missing condition report → `400 VALIDATION_FAILED`.
+
+    At 12:00 the system sets the rental to `OVERDUE`; it appears in `overdue_rentals` of the operator queue of HUB-01.
+
+    **Check-in** at 13:30 by operator OP-27 (`assigned_hub_ids: ["HUB-02"]`); OP-11 could not do this, as they are not assigned to HUB-02:
+    ```
+    POST /v1/rentals/RNT-8812/checkin
+    Idempotency-Key: 5d2b...
+    { "return_hub_id":"HUB-02",
+      "condition_report":{"battery_pct":20,"bike_condition":"GOOD",
+        "equipment":[{"equipment_id":"EQ-CHILD-01","status":"OK"},
+                     {"equipment_id":"EQ-RAIN-02","status":"DAMAGED","notes":"Torn side seam","attachment_ids":["ATT-77"]}]} }
+    → 200 OK
+    { "rental":{"rental_id":"RNT-8812","status":"RETURNED","returned_at":"2026-11-20T13:30:00Z",
+                "flags":["LATE_RETURN","DIFFERENT_RETURN_HUB","EQUIPMENT_DAMAGED"], ...},
+      "invoice":{"invoice_id":"INV-5011","total_minor":5050,"currency":"EUR"} }
+    ```
+    Invoice INV-5011 (immutable): duration 4 h 25 min → 9 × 250 = 2250; child seat 300; rain cover 200;
+    late fee 90 min → 3 × 500 = **1500**; different-hub fee 800 → **total 5050**. No damage fee on it (assumption 8).
+    Side effects: BIKE-402 and both equipment items now at HUB-02; EQ-RAIN-02 status `DAMAGED` (not reservable);
+    BIKE-402 (20 % battery) and EQ-RAIN-02 appear under "needs attention" in HUB-02's queue; the return is flagged for operations.
+    Errors: OP-27 not assigned to `return_hub_id` → `403 HUB_NOT_ASSIGNED`; a rented equipment item missing from
+    `condition_report.equipment` → `422 EQUIPMENT_NOT_ACCOUNTED_FOR`; rental already `RETURNED` (new key) → `409 INVALID_STATE_TRANSITION`.
+    **The check-in is retried with the same `Idempotency-Key` → the same 200 body is replayed, no second invoice.**
+
+    ## W3 – Two residents reserve the same last eligible bike for the same time
+    Resident A (key `aaaa…`) and resident B (key `bbbb…`) both send `POST /v1/reservations` for BIKE-77 at HUB-04,
+    2026-11-21 14:00–16:00, at 10:00:00.000.
+
+    Server: both transactions insert an allocation `(BIKE-77, [14:00,16:00))`. The exclusion constraint lets exactly
+    one commit (A). B's insert fails on the constraint → its transaction rolls back (including its equipment
+    allocations) → `409`. There is no read-then-write gap, so no lock ordering or timing assumption is needed.
+
+    **Resulting state:** exactly one reservation, RES-101 `CONFIRMED` for A; BIKE-77 has one allocation; nothing was
+    stored for B; B's active reservation count is unchanged.
+
+    Response to A:
+    ```
+    201 Created   Location: /v1/reservations/RES-101   ETag: "1"
+    { "reservation_id":"RES-101","status":"CONFIRMED","bike_id":"BIKE-77","pickup_hub_id":"HUB-04",
+      "start":"2026-11-21T14:00:00Z","end":"2026-11-21T16:00:00Z","collect_by":"2026-11-21T14:15:00Z", ... }
+    ```
+    Response to B:
+    ```
+    409 Conflict   Content-Type: application/problem+json
+    { "type":"https://api.urbanmove.city/problems/asset-unavailable","title":"Asset no longer available",
+      "status":409,"code":"ASSET_UNAVAILABLE",
+      "detail":"BIKE-77 was reserved by another customer for an overlapping period.",
+      "instance":"/v1/reservations","conflicting_assets":["BIKE-77"],
+      "alternatives_href":"/v1/availability/bikes?hub_id=HUB-04&start=2026-11-21T14:00:00Z&end=2026-11-21T16:00:00Z" }
+    ```
+    B never receives a 201 that is later revoked. If B times out and retries with key `bbbb…`, it gets the same 409 replayed.
+    To try again (e.g. another bike) B sends a **new** key.
+
+    ## W4 – Six-week recurring organisation request, one occurrence cannot be fulfilled
+    1. Member USR-2001 of ORG-7:
+       ```
+       POST /v1/reservation-requests    Idempotency-Key: ...
+       { "pickup_hub_id":"HUB-04","planned_return_hub_id":"HUB-04","bike_count":3,
+         "requirements":{"min_load_capacity_kg":100},
+         "recurrence":{"frequency":"WEEKLY","weekday":"TUESDAY","start_local_time":"08:00","end_local_time":"12:00",
+                       "time_zone":"Europe/Berlin","first_date":"2026-11-24","occurrence_count":6},
+         "purpose":"Food bank deliveries" }
+       → 201 Created  Location: /v1/reservation-requests/REQ-44   { "status":"SUBMITTED", ... }
+       ```
+       No reservations exist yet, so nothing is visible as booked and no assets are allocated.
+    2. Coordinator checks `GET /v1/reservation-requests/REQ-44/feasibility` → occurrence 2026-12-08 has only 2 of 3
+       eligible bikes: BIKE-12 has maintenance window MW-55 and HUB-04 has only 3 bikes with ≥ 100 kg.
+    3. Coordinator approves *without* accepting partial fulfilment:
+       `POST /v1/reservation-requests/REQ-44/approve {"allow_partial": false}` →
+       `409 PARTIAL_FULFILMENT_NOT_ACCEPTED` listing the short occurrence; **nothing is created**, the request stays `SUBMITTED`.
+    4. Coordinator approves with `{"allow_partial": true, "note":"Dec 8: 2 bikes only (maintenance)"}`. In **one transaction**
+       the system allocates every occurrence with the same rules and constraint as W1/W3 (if a concurrent booking takes a
+       bike in the meantime, that occurrence is re-evaluated in the same transaction) → **200 OK**:
+       ```
+       { "request_id":"REQ-44","status":"APPROVED",
+         "fulfilment":{"occurrences_total":6,"bikes_requested_total":18,"reservations_created":17,"bikes_unfulfilled":1},
+         "occurrences_href":"/v1/reservation-requests/REQ-44/occurrences",
+         "unfulfilled":[{"occurrence_id":"OCC-44-3","date":"2026-12-08","bikes_requested":3,"bikes_allocated":2,
+                         "shortfall":[{"count":1,"reason":"MAINTENANCE_WINDOW","reference":"MW-55"}]}] }
+       ```
+    **Resulting state:** REQ-44 `APPROVED`; 17 reservations `CONFIRMED` with `origin = ORGANISATION_REQUEST`, `request_id = REQ-44`,
+    customer = ORG-7; occurrence OCC-44-3 `PARTIALLY_FULFILLED` (2 reservations); the other 5 occurrences `FULFILLED`.
+    No placeholder reservation exists for the missing bike. **The member** receives a notification and sees the same data
+    via `GET /v1/reservation-requests/REQ-44` and `/occurrences`. If BIKE-12 is freed later, the occurrence is **not**
+    auto-filled (assumption); the member may create an ordinary reservation.
+
+    **Edit after approval** (explicit behaviour): `PATCH /v1/reservation-requests/REQ-44` with `effective_from` →
+    status `AMENDMENT_PENDING`; existing reservations stay valid. On coordinator approval, every `CONFIRMED` reservation with
+    start ≥ `effective_from` is cancelled (reason `ORGANISATION_REQUEST_CHANGE`, free if > 24 h before start, otherwise the
+    cancellation fee applies) and is regenerated under the new pattern; earlier and already collected reservations are untouched.
+    On rejection, the request returns to `APPROVED` unchanged.
+    **Cancel** (explicit behaviour): `POST /v1/reservation-requests/REQ-44/cancel {"effective_from":"2026-12-08"}` cancels all
+    `CONFIRMED` reservations from that date on with the normal 24-hour fee rule (per reservation, listed in the response);
+    reservations before that date and rentals in progress are kept.
+
+    ## W5 – Resident disputes the late-return fee; support grants a partial credit
+    1. `GET /v1/invoices/INV-5011` → 200 (the owner). Another resident gets `404 NOT_FOUND`; a technician gets `403 ROLE_NOT_PERMITTED`.
+    2. ```
+       POST /v1/disputes   Idempotency-Key: ...
+       { "invoice_id":"INV-5011","line_item_id":"LI-5011-4","disputed_amount_minor":1500,
+         "reason_code":"LATE_FEE_INCORRECT","explanation":"I queued 40 minutes at HUB-02 before check-in." }
+       → 201 Created  Location: /v1/disputes/DSP-301   { "status":"OPEN", ... }
+       ```
+       Errors: second open dispute on the same line → `409 DISPUTE_ALREADY_OPEN`; amount > line amount → `422 AMOUNT_EXCEEDS_LINE`; > 60 days → `422 DISPUTE_WINDOW_CLOSED`.
+    3. Support agent: `POST /v1/disputes/DSP-301/start-review` → `UNDER_REVIEW`.
+    4. Support agent verifies the queue camera log (30 min confirmed) and grants **half** of the fee:
+       ```
+       POST /v1/disputes/DSP-301/resolve   Idempotency-Key: ...
+       { "decision":"PARTIALLY_ACCEPTED","credit_amount_minor":750,"settlement":"REFUND_TO_PAYMENT_METHOD",
+         "note":"Queue delay of 30 min verified; remaining 60 min late fee stands." }
+       → 200 OK
+       { "dispute_id":"DSP-301","status":"RESOLVED",
+         "resolution":{"decision":"PARTIALLY_ACCEPTED","credited_amount_minor":750,"credit_note_id":"CN-902", ...} }
+       ```
+    **Resulting state:** INV-5011 unchanged (`total_minor: 5050`, same line items). New immutable credit note CN-902
+    (`-750`, linked to INV-5011, line LI-5011-4 and DSP-301). `GET /v1/invoices/INV-5011` shows `credit_notes: [CN-902]`
+    and the derived `net_amount_minor: 4300`. A second resolve (new key) → `409 INVALID_STATE_TRANSITION`; a retry with the
+    same key replays the 200 and does not create a second credit note.
+
+    ## Safe retry of a timed-out write (reservation)
+    1. The app generates `Idempotency-Key: 7b9e2a41-3d6f-4c81-a9e0-112233445566` when the user taps *Reserve* and stores it with the draft.
+    2. `POST /v1/reservations` → the server commits RES-555, but the response is lost (timeout).
+    3. The app retries **the same body with the same key** (exponential backoff). The server finds the stored outcome and returns
+       `201 Created`, `Location: /v1/reservations/RES-555`, `Idempotent-Replayed: true`. There is no second allocation, so the
+       retry cannot fail with `409` against its own booking and does not count twice toward the limit of 2.
+    4. If the retry arrives while the first request is still running → `409 IDEMPOTENCY_IN_PROGRESS` + `Retry-After: 1`.
+    5. If the app (wrongly) sends a different body with that key → `422 IDEMPOTENCY_KEY_REUSED`.
+    6. If the key expired (> 24 h), the app first checks `GET /v1/reservations?status=CONFIRMED&start_from=...`.
+    The same mechanism protects charges: check-in (invoice) and dispute resolution (credit note).
+
+    ---
+
+    # 5. Lifecycles
+
+    ## Reservation
+    ```
+                 ┌──────────────► EXPIRED     (system, start+15 min, no checkout)
+    CONFIRMED ───┼──────────────► CHECKED_OUT (operator: POST /rentals with reservation_id)
+                 └──────────────► CANCELLED   (customer / coordinator / system)
+    ```
+    | From | To | Trigger | Who |
+    |---|---|---|---|
+    | – | `CONFIRMED` | `POST /v1/reservations` | Resident, Org member (own) |
+    | – | `CONFIRMED` | `POST /v1/reservation-requests/{id}/approve` | Coordinator (system creates them) |
+    | `CONFIRMED` | `CHECKED_OUT` | `POST /v1/rentals` with `reservation_id` | Hub operator assigned to pickup hub |
+    | `CONFIRMED` | `EXPIRED` | not collected by `collect_by` (start + 15 min); no-show fee invoice | System |
+    | `CONFIRMED` | `CANCELLED` | `POST /v1/reservations/{id}/cancel`: free ≥ 24 h before start, else fee unless `service_outage_id` | Owner resident; org member (org reservation); Support agent (on customer's behalf) |
+    | `CONFIRMED` | `CANCELLED` | request amended/cancelled, displacement by maintenance/block (free if not reassigned) | Coordinator / System |
+
+    `CHECKED_OUT`, `EXPIRED` and `CANCELLED` are terminal. A substitute bike at checkout does not change the reservation state.
+
+    ## Rental
+    | From | To | Trigger | Who |
+    |---|---|---|---|
+    | – | `ACTIVE` | `POST /v1/rentals` (with or without reservation; identity check + condition report mandatory) | Hub operator assigned to pickup hub |
+    | `ACTIVE` | `ACTIVE` (new `due_at`) | `POST /v1/rentals/{id}/extensions`, only before `due_at`, only if bike + equipment are free for the extension | Owner (resident/org member), hub operator |
+    | `ACTIVE` | `OVERDUE` | `due_at` passes | System |
+    | `ACTIVE` / `OVERDUE` | `RETURNED` | `POST /v1/rentals/{id}/checkin` → invoice issued | Hub operator assigned to **return** hub |
+
+    Late return, different hub, damaged/missing equipment are **flags** on a `RETURNED` rental (plus operations follow-ups),
+    not separate states. A rental always ends `RETURNED` and always has exactly one rental invoice.
+    Supplementary condition reports can be appended afterwards (`POST /v1/rentals/{id}/condition-reports`); reports are never edited.
+
+    ## Fault
+    | From | To | Trigger | Who |
+    |---|---|---|---|
+    | – | `REPORTED` | `POST /v1/faults` | Technician, Hub operator (assigned hub), Coordinator |
+    | `REPORTED` | `IN_PROGRESS` | `POST /v1/faults/{id}/start-work` | Technician |
+    | `REPORTED` / `IN_PROGRESS` | `RESOLVED` | `POST /v1/faults/{id}/resolve` (`FIXED`, `NOT_REPRODUCIBLE`, `DUPLICATE`) | Technician |
+
+    While a `CRITICAL` fault is `REPORTED`/`IN_PROGRESS`, the bike is excluded from availability **and** checkout
+    (immediately, same transaction). Future reservations on it are reassigned to an equivalent bike when possible,
+    otherwise flagged in the operator queue and an outage record makes cancellation free for the customer.
+    Resolving recalculates the bike's `technical_status` (other faults, maintenance, battery still apply); it never
+    modifies condition reports, rentals, invoices or disputes. `RESOLVED` is terminal; a recurrence is a new fault (`related_fault_id`).
+
+    ## Maintenance window
+    | From | To | Trigger | Who |
+    |---|---|---|---|
+    | – | `SCHEDULED` | `POST /v1/maintenance-windows` (409 if it overlaps reservations/rentals, unless coordinator uses `displacement`) | Technician, Coordinator |
+    | `SCHEDULED` | `COMPLETED` | `POST /v1/maintenance-windows/{id}/complete` (frees the remaining time) | Technician |
+    | `SCHEDULED` | `CANCELLED` | `POST /v1/maintenance-windows/{id}/cancel` | Technician, Coordinator |
+
+    ## Operational block
+    `ACTIVE` → `CANCELLED` (coordinator, `POST /v1/operational-blocks/{id}/cancel`); an `ACTIVE` block whose `end` has passed is reported as `ENDED`.
+
+    ## Reservation request (organisation)
+    | From | To | Trigger | Who |
+    |---|---|---|---|
+    | – | `SUBMITTED` | `POST /v1/reservation-requests` | Org member |
+    | `SUBMITTED` | `APPROVED` | `/approve` (creates reservations; 409 if partial and `allow_partial=false`) | Coordinator |
+    | `SUBMITTED` | `REJECTED` | `/reject` | Coordinator |
+    | `SUBMITTED` | `CANCELLED` | `/cancel` (withdraw; no reservations exist) | Org member of same organisation |
+    | `APPROVED` | `AMENDMENT_PENDING` | `PATCH` with `effective_from` | Org member |
+    | `AMENDMENT_PENDING` | `APPROVED` | `/approve` (replace future reservations) or `/reject` (discard amendment) | Coordinator |
+    | `APPROVED` / `AMENDMENT_PENDING` | `CANCELLED` | `/cancel` with `effective_from` (future reservations cancelled, fee rule per reservation) | Org member, Coordinator |
+    | `APPROVED` | `COMPLETED` | last occurrence ended | System |
+
+    ## Dispute
+    `OPEN` → `UNDER_REVIEW` (support, `/start-review`) → `RESOLVED` (support, `/resolve` with decision
+    `ACCEPTED` / `PARTIALLY_ACCEPTED` / `REJECTED`; credit note for accepted amounts). `OPEN`/`UNDER_REVIEW` → `WITHDRAWN` (owner, `/withdraw`).
+
+    ## Invoice / credit note
+    Created directly as `ISSUED`; there are no transitions. Never modified or deleted.
+
+    ---
+
+    # 6. How permissions are enforced
+    * **A resident cannot read another resident's invoice.** Every invoice query is scoped in the data layer:
+      `WHERE customer_id = :sub` (residents) or `customer_id = :organisation_id` (org members, organisation invoices).
+      A non-matching id returns **404** (not 403) so the existence of other customers' invoices is not revealed.
+      Collection endpoints never accept a `customer_id` filter from customers. Only `SUPPORT_AGENT` (and
+      `OPS_COORDINATOR` read-only for organisation billing) bypass ownership.
+    * **An operator cannot act at an unassigned hub.** Checkout checks `hub_id` (and the reservation's pickup hub),
+      check-in checks `return_hub_id`, the queue checks the path `hubId` against `assigned_hub_ids` → `403 HUB_NOT_ASSIGNED`.
+      The hub is taken from the request **and** cross-checked with the stored resource, so a forged `hub_id` cannot
+      be used to act on a rental held at another hub.
+    * **A technician cannot change a charge.** No charge-modifying endpoint lists `TECHNICIAN`; the role gate runs before any lookup and
+      returns `403 ROLE_NOT_PERMITTED`. Charges only change through new documents (`CreditNote`) created by `SUPPORT_AGENT`.
+      Resolving a fault has no financial side effects.
+  contact:
+    name: UrbanMove API group
+servers:
+  - url: https://api.urbanmove.city
+    description: Production
+  - url: https://sandbox.api.urbanmove.city
+    description: Sandbox
+security:
+  - bearerAuth: []
+tags:
+  - name: Profile
+  - name: Attachments
+  - name: Hubs
+  - name: Fleet
+    description: Bikes and equipment (master data). `technical_status`, `battery_pct` and bookability are derived and read-only.
+  - name: Availability
+    description: Computed read models. Results are snapshots, **not** holds.
+  - name: Reservations
+  - name: Rentals
+    description: Physical custody. Checkout = `POST /v1/rentals`.
+  - name: Condition reports
+  - name: Faults & maintenance
+  - name: Operations
+    description: Operational blocks and documented service outages.
+  - name: Organisations
+  - name: Reservation requests
+    description: Recurring organisation requests and their generated occurrences.
+  - name: Billing
+    description: Immutable invoices and credit notes.
+  - name: Disputes
+
+paths:
+  # ───────────────────────────── Profile ─────────────────────────────
+  /v1/me:
+    get:
+      tags: [Profile]
+      operationId: getMe
+      summary: Get own profile
+      description: "**Roles:** any authenticated user. Returns only the caller's own data."
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, TECHNICIAN, SUPPORT_AGENT]
+      responses:
+        '200':
+          description: Profile
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Profile]
+      operationId: updateMe
+      summary: Update own profile
+      description: "**Roles:** any authenticated user (own profile only). Roles, organisation and hub assignments are not editable here (identity provider)."
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, TECHNICIAN, SUPPORT_AGENT]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MePatch' }
+            example: { phone: "+49 170 5550123" }
+      responses:
+        '200':
+          description: Updated profile
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
+
+  # ───────────────────────────── Attachments ─────────────────────────────
+  /v1/attachments:
+    post:
+      tags: [Attachments]
+      operationId: uploadAttachment
+      summary: Upload a photo or document
+      description: |
+        **Roles:** Hub operator, Technician, Resident/Org member (dispute evidence), Support agent.
+        Uses `multipart/form-data` (binary upload). The returned `attachment_id` is referenced from condition reports,
+        faults and disputes. Max 10 MB; `image/jpeg`, `image/png`, `application/pdf`.
+        Attachments are only readable by users who can read the resource that references them.
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, TECHNICIAN, SUPPORT_AGENT]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                description: { type: string, maxLength: 200 }
+      responses:
+        '201':
+          description: Uploaded
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Attachment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413':
+          description: File too large
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '415':
+          description: Unsupported file type
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ───────────────────────────── Hubs ─────────────────────────────
+  /v1/hubs:
+    get:
+      tags: [Hubs]
+      operationId: listHubs
+      summary: List hubs
+      description: "**Roles:** public (no token required). Static hub data only; for availability use `/v1/availability/hub-summaries`."
+      security: []
+      x-roles: [PUBLIC]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/HubStatus' } }
+        - { name: lat, in: query, schema: { type: number, format: double } }
+        - { name: lng, in: query, schema: { type: number, format: double } }
+        - { name: radius_km, in: query, schema: { type: number, minimum: 0.1, maximum: 50 } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of hubs
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    post:
+      tags: [Hubs]
+      operationId: createHub
+      summary: Create hub
+      description: "**Roles:** Operations coordinator."
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HubCreate' }
+            example:
+              name: Hauptbahnhof Nord
+              address: Bahnhofplatz 1
+              location: { lat: 52.5251, lng: 13.3694 }
+              opening_hours: "Mo-Su 06:00-22:00"
+              parking_slots: 12
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hub' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/hubs/{hubId}:
+    parameters:
+      - $ref: '#/components/parameters/HubId'
+    get:
+      tags: [Hubs]
+      operationId: getHub
+      summary: Get hub
+      description: "**Roles:** public."
+      security: []
+      x-roles: [PUBLIC]
+      responses:
+        '200':
+          description: Hub
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hub' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Hubs]
+      operationId: updateHub
+      summary: Update hub (incl. deactivate)
+      description: |
+        **Roles:** Operations coordinator. Setting `status: INACTIVE` is only allowed when no future reservations
+        start at the hub (`409 HUB_HAS_FUTURE_RESERVATIONS`); otherwise use an operational block with displacement.
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HubPatch' }
+      responses:
+        '200':
+          description: Updated
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hub' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
+  /v1/hubs/{hubId}/operator-queue:
+    parameters:
+      - $ref: '#/components/parameters/HubId'
+    get:
+      tags: [Hubs]
+      operationId: getOperatorQueue
+      summary: "Read model: operator work queue for one hub and day"
+      description: |
+        **Roles:** Hub operator **assigned to `hubId`** (else `403 HUB_NOT_ASSIGNED`); Operations coordinator (any hub).
+
+        Computed view for one hub and one local calendar day: planned pickups, expected returns, overdue rentals
+        (including rentals picked up here and overdue anywhere), and bikes/equipment needing attention
+        (low battery, open faults incl. critical, maintenance today, returned from another hub, damaged equipment).
+        Bikes that are **not bookable** still appear here. Personal data is limited to display name and reference.
+      x-roles: [HUB_OPERATOR, OPS_COORDINATOR]
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: Local date of the hub (YYYY-MM-DD)
+          schema: { type: string, format: date }
+          example: "2026-11-20"
+        - name: sections
+          in: query
+          description: Restrict to some sections (default all)
+          style: form
+          explode: false
+          schema:
+            type: array
+            items: { type: string, enum: [planned_pickups, expected_returns, overdue_rentals, bikes_needing_attention, equipment_needing_attention] }
+      responses:
+        '200':
+          description: Queue
+          headers:
+            Cache-Control:
+              schema: { type: string }
+              example: "private, max-age=15"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorQueue' }
+              example:
+                hub_id: HUB-02
+                date: "2026-11-20"
+                generated_at: "2026-11-20T12:40:00Z"
+                planned_pickups:
+                  - { reservation_id: RES-9930, start: "2026-11-20T14:00:00Z", collect_by: "2026-11-20T14:15:00Z", customer_display_name: "J. Novak", bike_id: BIKE-410, equipment_types: [DELIVERY_CRATE], origin: INDIVIDUAL, at_risk: false }
+                expected_returns:
+                  - { rental_id: RNT-8820, due_at: "2026-11-20T15:00:00Z", bike_id: BIKE-415, customer_display_name: "A. Weber", pickup_hub_id: HUB-02 }
+                overdue_rentals:
+                  - { rental_id: RNT-8812, due_at: "2026-11-20T12:00:00Z", minutes_overdue: 40, bike_id: BIKE-402, customer_display_name: "M. Schulz", planned_return_hub_id: HUB-01, pickup_hub_id: HUB-01 }
+                bikes_needing_attention:
+                  - { bike_id: BIKE-417, reasons: [OPEN_CRITICAL_FAULT], battery_pct: 64, open_fault_ids: [FLT-310], bookable: false }
+                  - { bike_id: BIKE-419, reasons: [LOW_BATTERY], battery_pct: 18, open_fault_ids: [], bookable: false }
+                equipment_needing_attention:
+                  - { equipment_id: EQ-RAIN-07, equipment_type: RAIN_COVER, status: DAMAGED }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Role not permitted or hub not assigned
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://api.urbanmove.city/problems/hub-not-assigned
+                title: Hub not assigned
+                status: 403
+                code: HUB_NOT_ASSIGNED
+                detail: You are not assigned to hub HUB-02.
+                instance: /v1/hubs/HUB-02/operator-queue
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Fleet ─────────────────────────────
+  /v1/bikes:
+    get:
+      tags: [Fleet]
+      operationId: listBikes
+      summary: List bikes (staff view)
+      description: |
+        **Roles:** Coordinator, Technician (all hubs); Hub operator (results restricted to assigned hubs; `hub_id` outside → `403 HUB_NOT_ASSIGNED`).
+        Shows **all** bikes including non-bookable ones with `unavailability_reasons`. Customers use `/v1/availability/*` instead.
+      x-roles: [HUB_OPERATOR, OPS_COORDINATOR, TECHNICIAN]
+      parameters:
+        - { name: hub_id, in: query, schema: { type: string } }
+        - { name: technical_status, in: query, schema: { $ref: '#/components/schemas/TechnicalStatus' } }
+        - { name: bookable_now, in: query, schema: { type: boolean } }
+        - { name: bike_type, in: query, schema: { $ref: '#/components/schemas/BikeType' } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of bikes
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BikePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Fleet]
+      operationId: createBike
+      summary: Add bike to fleet
+      description: "**Roles:** Operations coordinator."
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BikeCreate' }
+            example: { bike_type: LONG_JOHN, model: UrbanCargo Heavy 200, load_capacity_kg: 120, accessibility_features: [STEP_THROUGH_FRAME], hub_id: HUB-01 }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bike' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+  /v1/bikes/{bikeId}:
+    parameters:
+      - $ref: '#/components/parameters/BikeId'
+    get:
+      tags: [Fleet]
+      operationId: getBike
+      summary: Get bike (staff view)
+      description: "**Roles:** Coordinator, Technician; Hub operator only for bikes currently at an assigned hub (else 404)."
+      x-roles: [HUB_OPERATOR, OPS_COORDINATOR, TECHNICIAN]
+      responses:
+        '200':
+          description: Bike
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bike' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Fleet]
+      operationId: updateBike
+      summary: Update bike master data, relocate or retire
+      description: |
+        **Roles:** Operations coordinator. `technical_status`, `battery_pct` and bookability are derived and cannot be set.
+        Relocating (`hub_id`) or retiring a bike with future allocations → `409 BIKE_HAS_FUTURE_ALLOCATIONS`.
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BikePatch' }
+      responses:
+        '200':
+          description: Updated
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Bike' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
+  /v1/equipment:
+    get:
+      tags: [Fleet]
+      operationId: listEquipment
+      summary: List equipment items (staff view)
+      description: "**Roles:** Coordinator, Technician; Hub operator (assigned hubs only)."
+      x-roles: [HUB_OPERATOR, OPS_COORDINATOR, TECHNICIAN]
+      parameters:
+        - { name: hub_id, in: query, schema: { type: string } }
+        - { name: equipment_type, in: query, schema: { $ref: '#/components/schemas/EquipmentType' } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/EquipmentStatus' } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of equipment
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EquipmentPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Fleet]
+      operationId: createEquipment
+      summary: Add equipment item to a hub
+      description: "**Roles:** Operations coordinator."
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EquipmentCreate' }
+            example: { equipment_type: CHILD_SEAT, hub_id: HUB-01, label: "Child seat #14" }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Equipment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/equipment/{equipmentId}:
+    parameters:
+      - $ref: '#/components/parameters/EquipmentId'
+    get:
+      tags: [Fleet]
+      operationId: getEquipment
+      summary: Get equipment item
+      description: "**Roles:** Coordinator, Technician; Hub operator (assigned hubs only, else 404)."
+      x-roles: [HUB_OPERATOR, OPS_COORDINATOR, TECHNICIAN]
+      responses:
+        '200':
+          description: Equipment
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Equipment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Fleet]
+      operationId: updateEquipment
+      summary: Relocate, repair or retire equipment
+      description: |
+        **Roles:** Coordinator (`hub_id`, `status` → `RETIRED`); Technician (`status` `DAMAGED` → `AVAILABLE` after repair, `MISSING` → `AVAILABLE` when found).
+        `IN_USE` is set only by checkout/check-in. Relocation with future allocations → `409 EQUIPMENT_HAS_FUTURE_ALLOCATIONS`.
+      x-roles: [OPS_COORDINATOR, TECHNICIAN]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EquipmentPatch' }
+      responses:
+        '200':
+          description: Updated
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Equipment' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
+
+  # ───────────────────────────── Availability (views) ─────────────────────────────
+  /v1/availability/hub-summaries:
+    get:
+      tags: [Availability]
+      operationId: listHubAvailabilitySummaries
+      summary: "Read model: customer map – bookable bike count per type and hub"
+      description: |
+        **Roles:** public (no token). Lightweight, paginated, filterable, cacheable (`Cache-Control: public, max-age=30`).
+        Counts only bikes that are **bookable for the whole window** with all filters applied: never bikes that are merely parked.
+        Contains no bike IDs and no personal data. Default window: now → now + 2 h.
+      security: []
+      x-roles: [PUBLIC]
+      parameters:
+        - { name: lat, in: query, schema: { type: number, format: double }, description: "Centre; required together with lng unless bbox is given" }
+        - { name: lng, in: query, schema: { type: number, format: double } }
+        - { name: radius_km, in: query, schema: { type: number, default: 3, minimum: 0.1, maximum: 25 } }
+        - name: bbox
+          in: query
+          description: "Alternative to lat/lng/radius: minLng,minLat,maxLng,maxLat"
+          schema: { type: string }
+          example: "13.30,52.48,13.45,52.56"
+        - { name: start, in: query, schema: { type: string, format: date-time } }
+        - { name: end, in: query, schema: { type: string, format: date-time } }
+        - { name: bike_type, in: query, schema: { $ref: '#/components/schemas/BikeType' } }
+        - { name: min_load_capacity_kg, in: query, schema: { type: integer, minimum: 0 } }
+        - name: accessibility_features
+          in: query
+          style: form
+          explode: false
+          schema: { type: array, items: { $ref: '#/components/schemas/AccessibilityFeature' } }
+        - { name: min_range_km, in: query, schema: { type: integer, minimum: 0 } }
+        - name: equipment_types
+          in: query
+          style: form
+          explode: false
+          schema: { type: array, items: { $ref: '#/components/schemas/EquipmentType' } }
+        - { name: only_with_availability, in: query, schema: { type: boolean, default: true } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of hub summaries, ordered by distance
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+            Cache-Control:
+              schema: { type: string }
+              example: "public, max-age=30"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubAvailabilitySummaryPage' }
+              example:
+                items:
+                  - hub_id: HUB-01
+                    name: Hauptbahnhof Nord
+                    location: { lat: 52.5251, lng: 13.3694 }
+                    distance_km: 0.4
+                    window: { start: "2026-11-20T09:00:00Z", end: "2026-11-20T12:00:00Z" }
+                    bikes_available: [ { bike_type: LONG_JOHN, count: 3 }, { bike_type: TRIKE, count: 1 } ]
+                    equipment_available: [ { equipment_type: CHILD_SEAT, count: 2 }, { equipment_type: RAIN_COVER, count: 4 } ]
+                next_cursor: "eyJvZmYiOiJIVUItMDEifQ"
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /v1/availability/bikes:
+    get:
+      tags: [Availability]
+      operationId: searchEligibleBikes
+      summary: "Read model: eligible bikes and equipment at one hub for a period"
+      description: |
+        **Roles:** Resident, Org member, Hub operator (walk-in at assigned hub), Coordinator.
+        Returns only bikes satisfying **all** rules for the **complete** period (see assumption 3) and equipment items
+        free for the complete period at that hub. The result is a snapshot (`is_binding: false`): reserving may still return `409`.
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR]
+      parameters:
+        - { name: hub_id, in: query, required: true, schema: { type: string }, example: HUB-01 }
+        - { name: start, in: query, required: true, schema: { type: string, format: date-time }, example: "2026-11-20T09:00:00Z" }
+        - { name: end, in: query, required: true, schema: { type: string, format: date-time }, example: "2026-11-20T12:00:00Z" }
+        - { name: bike_type, in: query, schema: { $ref: '#/components/schemas/BikeType' } }
+        - { name: min_load_capacity_kg, in: query, schema: { type: integer, minimum: 0 }, example: 80 }
+        - name: accessibility_features
+          in: query
+          style: form
+          explode: false
+          schema: { type: array, items: { $ref: '#/components/schemas/AccessibilityFeature' } }
+        - { name: min_range_km, in: query, schema: { type: integer, minimum: 0 }, example: 30 }
+        - name: equipment_types
+          in: query
+          style: form
+          explode: false
+          schema: { type: array, items: { $ref: '#/components/schemas/EquipmentType' } }
+          example: [CHILD_SEAT, RAIN_COVER]
+      responses:
+        '200':
+          description: Eligible bikes and equipment
+          headers:
+            Cache-Control:
+              schema: { type: string }
+              example: no-store
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EligibleBikesResult' }
+              example:
+                hub_id: HUB-01
+                start: "2026-11-20T09:00:00Z"
+                end: "2026-11-20T12:00:00Z"
+                is_binding: false
+                generated_at: "2026-11-18T17:02:11Z"
+                bikes:
+                  - { bike_id: BIKE-402, bike_type: LONG_JOHN, model: UrbanCargo Heavy 200, load_capacity_kg: 120, accessibility_features: [STEP_THROUGH_FRAME], battery_pct: 92, estimated_range_km: 55, price_estimate_minor: 1500, currency: EUR }
+                equipment:
+                  - { equipment_id: EQ-CHILD-01, equipment_type: CHILD_SEAT }
+                  - { equipment_id: EQ-RAIN-02, equipment_type: RAIN_COVER }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Reservations ─────────────────────────────
+  /v1/reservations:
+    get:
+      tags: [Reservations]
+      operationId: listReservations
+      summary: List reservations
+      description: |
+        **Roles & scope:** Resident → own only; Org member → own + their organisation's (`scope=organisation`);
+        Hub operator → reservations with pickup at assigned hubs; Coordinator, Support agent → all (may filter by `customer_id`).
+        Customers cannot use `customer_id` (ignored → 400 if supplied).
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, SUPPORT_AGENT]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/ReservationStatus' } }
+        - { name: scope, in: query, schema: { type: string, enum: [own, organisation], default: own } }
+        - { name: hub_id, in: query, schema: { type: string } }
+        - { name: request_id, in: query, schema: { type: string } }
+        - { name: customer_id, in: query, schema: { type: string }, description: Staff only }
+        - { name: start_from, in: query, schema: { type: string, format: date-time } }
+        - { name: start_to, in: query, schema: { type: string, format: date-time } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of reservations
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Reservations]
+      operationId: createReservation
+      summary: Reserve a bike (and optional equipment)
+      description: |
+        **Roles:** Resident, Org member (for themselves). Atomic: the bike and every equipment item are allocated for the
+        complete period in one transaction or nothing is (see W1, W3). Re-validates eligibility server-side;
+        never trusts the earlier search. Requires `Idempotency-Key` (see *Safe retry*).
+      x-roles: [RESIDENT, ORG_MEMBER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationCreate' }
+            example:
+              bike_id: BIKE-402
+              pickup_hub_id: HUB-01
+              planned_return_hub_id: HUB-01
+              start: "2026-11-20T09:00:00Z"
+              end: "2026-11-20T12:00:00Z"
+              equipment_ids: [EQ-CHILD-01, EQ-RAIN-02]
+              requirements: { min_load_capacity_kg: 80, accessibility_features: [STEP_THROUGH_FRAME], min_range_km: 30 }
+      responses:
+        '201':
+          description: Reservation confirmed (example success response 1)
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            ETag: { $ref: '#/components/headers/ETag' }
+            Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+              example:
+                reservation_id: RES-9901
+                status: CONFIRMED
+                origin: INDIVIDUAL
+                customer: { type: RESIDENT, id: USR-1001 }
+                booked_by: USR-1001
+                request_id: null
+                bike_id: BIKE-402
+                pickup_hub_id: HUB-01
+                planned_return_hub_id: HUB-01
+                start: "2026-11-20T09:00:00Z"
+                end: "2026-11-20T12:00:00Z"
+                collect_by: "2026-11-20T09:15:00Z"
+                free_cancellation_until: "2026-11-19T09:00:00Z"
+                equipment: [ { equipment_id: EQ-CHILD-01, equipment_type: CHILD_SEAT }, { equipment_id: EQ-RAIN-02, equipment_type: RAIN_COVER } ]
+                requirements: { min_load_capacity_kg: 80, accessibility_features: [STEP_THROUGH_FRAME], min_range_km: 30 }
+                rental_id: null
+                cancellation: null
+                created_at: "2026-11-18T17:03:40Z"
+                links: { self: /v1/reservations/RES-9901, cancel: /v1/reservations/RES-9901/cancel }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Conflict with current state (example error response 1)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                assetUnavailable:
+                  summary: Lost the race for the last bike (W3)
+                  value:
+                    type: https://api.urbanmove.city/problems/asset-unavailable
+                    title: Asset no longer available
+                    status: 409
+                    code: ASSET_UNAVAILABLE
+                    detail: BIKE-77 was reserved by another customer for an overlapping period.
+                    instance: /v1/reservations
+                    trace_id: 4bf92f3577b34da6
+                    conflicting_assets: [BIKE-77]
+                    alternatives_href: /v1/availability/bikes?hub_id=HUB-04&start=2026-11-21T14:00:00Z&end=2026-11-21T16:00:00Z
+                limitReached:
+                  summary: Third active reservation
+                  value:
+                    type: https://api.urbanmove.city/problems/reservation-limit-reached
+                    title: Reservation limit reached
+                    status: 409
+                    code: RESERVATION_LIMIT_REACHED
+                    detail: You already hold 2 active reservations (RES-9901, RES-9910).
+                    instance: /v1/reservations
+                idempotencyInProgress:
+                  summary: Retry while original still running
+                  value:
+                    type: https://api.urbanmove.city/problems/idempotency-in-progress
+                    title: Request still in progress
+                    status: 409
+                    code: IDEMPOTENCY_IN_PROGRESS
+                    detail: A request with this Idempotency-Key is still being processed. Retry later.
+        '422':
+          description: Business rule violation
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                notEligible:
+                  value:
+                    type: https://api.urbanmove.city/problems/bike-not-eligible
+                    title: Bike not eligible
+                    status: 422
+                    code: BIKE_NOT_ELIGIBLE
+                    detail: BIKE-405 does not meet the requested load capacity (60 kg < 80 kg).
+                    instance: /v1/reservations
+                    errors: [ { field: bike_id, code: CAPACITY_TOO_LOW, message: "60 kg < 80 kg" } ]
+                keyReused:
+                  value:
+                    type: https://api.urbanmove.city/problems/idempotency-key-reused
+                    title: Idempotency key reused
+                    status: 422
+                    code: IDEMPOTENCY_KEY_REUSED
+                    detail: This Idempotency-Key was already used with a different request body.
+  /v1/reservations/{reservationId}:
+    parameters:
+      - $ref: '#/components/parameters/ReservationId'
+    get:
+      tags: [Reservations]
+      operationId: getReservation
+      summary: "Read model: detailed reservation/rental view with condition reports, charges and allowed next actions"
+      description: |
+        **Roles & scope:** owner Resident; Org member for own or their organisation's reservations; Hub operator at the pickup hub;
+        Coordinator; Support agent. Others → `404`.
+        Aggregates the reservation, its rental (if collected), all condition reports, invoices/credit notes and
+        `allowed_actions` computed for **this caller and this state** (e.g. `CANCEL` with fee preview, `EXTEND_RENTAL`, `OPEN_DISPUTE`).
+        Clients render buttons from `allowed_actions` instead of re-implementing rules.
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, SUPPORT_AGENT]
+      responses:
+        '200':
+          description: Reservation detail
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationDetail' }
+              example:
+                reservation_id: RES-9901
+                status: CHECKED_OUT
+                origin: INDIVIDUAL
+                customer: { type: RESIDENT, id: USR-1001 }
+                booked_by: USR-1001
+                bike: { bike_id: BIKE-402, bike_type: LONG_JOHN, model: UrbanCargo Heavy 200, load_capacity_kg: 120 }
+                pickup_hub_id: HUB-01
+                planned_return_hub_id: HUB-01
+                start: "2026-11-20T09:00:00Z"
+                end: "2026-11-20T12:00:00Z"
+                collect_by: "2026-11-20T09:15:00Z"
+                equipment: [ { equipment_id: EQ-CHILD-01, equipment_type: CHILD_SEAT }, { equipment_id: EQ-RAIN-02, equipment_type: RAIN_COVER } ]
+                rental:
+                  rental_id: RNT-8812
+                  status: RETURNED
+                  started_at: "2026-11-20T09:05:00Z"
+                  due_at: "2026-11-20T12:00:00Z"
+                  returned_at: "2026-11-20T13:30:00Z"
+                  return_hub_id: HUB-02
+                  flags: [LATE_RETURN, DIFFERENT_RETURN_HUB, EQUIPMENT_DAMAGED]
+                condition_reports:
+                  - { condition_report_id: CR-1, kind: CHECKOUT, recorded_at: "2026-11-20T09:05:00Z", hub_id: HUB-01, battery_pct: 95, bike_condition: GOOD, equipment: [ { equipment_id: EQ-CHILD-01, status: OK }, { equipment_id: EQ-RAIN-02, status: OK } ] }
+                  - { condition_report_id: CR-2, kind: CHECKIN, recorded_at: "2026-11-20T13:30:00Z", hub_id: HUB-02, battery_pct: 20, bike_condition: GOOD, equipment: [ { equipment_id: EQ-CHILD-01, status: OK }, { equipment_id: EQ-RAIN-02, status: DAMAGED, notes: Torn side seam } ] }
+                charges:
+                  currency: EUR
+                  invoices: [ { invoice_id: INV-5011, total_minor: 5050, net_amount_minor: 5050, issued_at: "2026-11-20T13:30:02Z" } ]
+                  credit_notes: []
+                  open_dispute_ids: []
+                allowed_actions:
+                  - { action: OPEN_DISPUTE, method: POST, href: /v1/disputes, note: "Possible until 2027-01-19" }
+                  - { action: VIEW_INVOICE, method: GET, href: /v1/invoices/INV-5011 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/reservations/{reservationId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/ReservationId'
+    post:
+      tags: [Reservations]
+      operationId: cancelReservation
+      summary: Cancel a reservation (state transition)
+      description: |
+        **Roles:** owner Resident; Org member (own or organisation reservation); Support agent (on the customer's behalf, reason required).
+        Only from `CONFIRMED`. Free when `now < start − 24 h`. Later: allowed, but a cancellation-fee invoice is issued unless
+        `reason = SERVICE_OUTAGE` with a `service_outage_id` that covers this reservation's hub/bike and time.
+        The fee to expect is shown beforehand in `allowed_actions[].fee_preview_minor`.
+      x-roles: [RESIDENT, ORG_MEMBER, SUPPORT_AGENT]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationCancel' }
+            examples:
+              free: { value: { reason: CUSTOMER_REQUEST } }
+              outage: { value: { reason: SERVICE_OUTAGE, service_outage_id: OUT-17, comment: "Hub closed due to flooding" } }
+      responses:
+        '200':
+          description: Cancelled
+          headers:
+            Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+              example:
+                reservation_id: RES-9915
+                status: CANCELLED
+                cancellation: { cancelled_at: "2026-11-21T08:00:00Z", cancelled_by: USR-1001, reason: CUSTOMER_REQUEST, late: true, fee_minor: 500, currency: EUR, fee_invoice_id: INV-5020 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: "Not in CONFIRMED (`INVALID_STATE_TRANSITION`)"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: "Outage does not cover this reservation (`OUTAGE_NOT_APPLICABLE`)"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ───────────────────────────── Rentals ─────────────────────────────
+  /v1/rentals:
+    get:
+      tags: [Rentals]
+      operationId: listRentals
+      summary: List rentals
+      description: |
+        **Roles & scope:** Resident → own; Org member → own + organisation's; Hub operator → rentals picked up or due back at assigned hubs;
+        Coordinator, Support agent → all.
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, SUPPORT_AGENT]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/RentalStatus' } }
+        - { name: hub_id, in: query, schema: { type: string } }
+        - { name: flag, in: query, schema: { $ref: '#/components/schemas/RentalFlag' } }
+        - { name: customer_id, in: query, schema: { type: string }, description: Staff only }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of rentals
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RentalPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Rentals]
+      operationId: checkoutRental
+      summary: Check out (start a rental), with or without a reservation
+      description: |
+        **Roles:** Hub operator assigned to `hub_id` (= the reservation's pickup hub when a reservation is given).
+        Requires an identity check and a condition report. Atomic with the reservation transition `CONFIRMED → CHECKED_OUT`.
+
+        * **With reservation:** `reservation_id`, must be `CONFIRMED` and `now ≤ collect_by`. Bike/equipment/due time come from it.
+          `bike_id` may name a substitute if the reserved bike became unavailable; it must meet the reservation's requirements.
+        * **Walk-in (no reservation):** `customer_id`, `bike_id`, `due_at`, optional `equipment_ids`; the bike/equipment must be
+          eligible and free from now until `due_at` (same allocation rules as reservations → `409 ASSET_UNAVAILABLE`).
+
+        A bike with an open critical fault, maintenance window, block or low battery cannot be checked out (`409 BIKE_NOT_CHECKOUTABLE`).
+      x-roles: [HUB_OPERATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutRequest' }
+            examples:
+              withReservation:
+                summary: W2 checkout
+                value:
+                  reservation_id: RES-9901
+                  hub_id: HUB-01
+                  identity_check: { method: ID_CARD, verified: true, document_reference_last4: "4471" }
+                  condition_report:
+                    battery_pct: 95
+                    bike_condition: GOOD
+                    equipment: [ { equipment_id: EQ-CHILD-01, status: OK }, { equipment_id: EQ-RAIN-02, status: OK } ]
+              walkIn:
+                summary: Walk-in rental without reservation
+                value:
+                  customer_id: USR-1044
+                  hub_id: HUB-01
+                  bike_id: BIKE-406
+                  due_at: "2026-11-20T16:00:00Z"
+                  planned_return_hub_id: HUB-01
+                  equipment_ids: [EQ-CRATE-03]
+                  identity_check: { method: APP_QR, verified: true }
+                  condition_report: { battery_pct: 81, bike_condition: MINOR_WEAR, notes: "Scratch on left side", equipment: [ { equipment_id: EQ-CRATE-03, status: OK } ] }
+      responses:
+        '201':
+          description: Rental started
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Rental' }
+              example:
+                rental_id: RNT-8812
+                status: ACTIVE
+                reservation_id: RES-9901
+                customer: { type: RESIDENT, id: USR-1001 }
+                bike_id: BIKE-402
+                pickup_hub_id: HUB-01
+                planned_return_hub_id: HUB-01
+                return_hub_id: null
+                started_at: "2026-11-20T09:05:00Z"
+                due_at: "2026-11-20T12:00:00Z"
+                returned_at: null
+                equipment: [ { equipment_id: EQ-CHILD-01, equipment_type: CHILD_SEAT }, { equipment_id: EQ-RAIN-02, equipment_type: RAIN_COVER } ]
+                flags: []
+                checked_out_by: OP-11
+                checked_in_by: null
+                extensions: []
+                condition_report_ids: [CR-1]
+                invoice_id: null
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Role not permitted or hub not assigned
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://api.urbanmove.city/problems/hub-not-assigned
+                title: Hub not assigned
+                status: 403
+                code: HUB_NOT_ASSIGNED
+                detail: Operator OP-27 is not assigned to hub HUB-01.
+                instance: /v1/rentals
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: "`RESERVATION_NOT_COLLECTABLE`, `BIKE_NOT_CHECKOUTABLE`, `ASSET_UNAVAILABLE`, `IDEMPOTENCY_IN_PROGRESS` (example error response 2)"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://api.urbanmove.city/problems/bike-not-checkoutable
+                title: Bike cannot be checked out
+                status: 409
+                code: BIKE_NOT_CHECKOUTABLE
+                detail: BIKE-402 has an open critical fault (FLT-301) reported at 08:40. Choose a substitute bike.
+                instance: /v1/rentals
+                trace_id: 0af7651916cd43dd
+                blocking_reasons: [OPEN_CRITICAL_FAULT]
+                alternatives_href: /v1/availability/bikes?hub_id=HUB-01&start=2026-11-20T09:05:00Z&end=2026-11-20T12:00:00Z&min_load_capacity_kg=80&accessibility_features=STEP_THROUGH_FRAME
+        '422':
+          description: "`BIKE_NOT_ELIGIBLE` (substitute), `IDENTITY_NOT_VERIFIED`, `EQUIPMENT_NOT_AT_HUB`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /v1/rentals/{rentalId}:
+    parameters:
+      - $ref: '#/components/parameters/RentalId'
+    get:
+      tags: [Rentals]
+      operationId: getRental
+      summary: "Read model: rental detail (also used for walk-in rentals)"
+      description: |
+        **Roles & scope:** owner (Resident / Org member); Hub operator at pickup or return hub; Coordinator; Support agent. Others → 404.
+        Same aggregate shape as the reservation detail: condition reports, charges and `allowed_actions`.
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, SUPPORT_AGENT]
+      responses:
+        '200':
+          description: Rental detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RentalDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/rentals/{rentalId}/checkin:
+    parameters:
+      - $ref: '#/components/parameters/RentalId'
+    post:
+      tags: [Rentals]
+      operationId: checkinRental
+      summary: Check in (end a rental) – records return hub, battery, condition, equipment; issues the invoice
+      description: |
+        **Roles:** Hub operator assigned to `return_hub_id`.
+        From `ACTIVE` or `OVERDUE` to `RETURNED`. Return time = server time. Every rented equipment item must appear in
+        `condition_report.equipment`. Returns at another hub are accepted and flagged (`DIFFERENT_RETURN_HUB`, possible fee).
+        Charges are computed from actual duration, equipment and late fee; the invoice is issued immutably in the same transaction.
+        Returns `200` (transition of an existing resource); the created invoice is embedded and linked.
+      x-roles: [HUB_OPERATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckinRequest' }
+            example:
+              return_hub_id: HUB-02
+              condition_report:
+                battery_pct: 20
+                bike_condition: GOOD
+                equipment:
+                  - { equipment_id: EQ-CHILD-01, status: OK }
+                  - { equipment_id: EQ-RAIN-02, status: DAMAGED, notes: Torn side seam, attachment_ids: [ATT-77] }
+      responses:
+        '200':
+          description: Rental returned and invoiced (example success response 2)
+          headers:
+            Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
+            Link:
+              schema: { type: string }
+              example: '</v1/invoices/INV-5011>; rel="invoice"'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckinResult' }
+              example:
+                rental:
+                  rental_id: RNT-8812
+                  status: RETURNED
+                  reservation_id: RES-9901
+                  customer: { type: RESIDENT, id: USR-1001 }
+                  bike_id: BIKE-402
+                  pickup_hub_id: HUB-01
+                  planned_return_hub_id: HUB-01
+                  return_hub_id: HUB-02
+                  started_at: "2026-11-20T09:05:00Z"
+                  due_at: "2026-11-20T12:00:00Z"
+                  returned_at: "2026-11-20T13:30:00Z"
+                  equipment: [ { equipment_id: EQ-CHILD-01, equipment_type: CHILD_SEAT }, { equipment_id: EQ-RAIN-02, equipment_type: RAIN_COVER } ]
+                  flags: [LATE_RETURN, DIFFERENT_RETURN_HUB, EQUIPMENT_DAMAGED]
+                  checked_out_by: OP-11
+                  checked_in_by: OP-27
+                  extensions: []
+                  condition_report_ids: [CR-1, CR-2]
+                  invoice_id: INV-5011
+                invoice:
+                  invoice_id: INV-5011
+                  invoice_number: UM-2026-005011
+                  status: ISSUED
+                  customer: { type: RESIDENT, id: USR-1001 }
+                  source: { type: RENTAL, id: RNT-8812 }
+                  currency: EUR
+                  line_items:
+                    - { line_item_id: LI-5011-1, type: BASE_DURATION, description: "Cargo bike, 4 h 25 min (9 × 30 min)", quantity: 9, unit_amount_minor: 250, amount_minor: 2250 }
+                    - { line_item_id: LI-5011-2, type: EQUIPMENT, description: Child seat, quantity: 1, unit_amount_minor: 300, amount_minor: 300 }
+                    - { line_item_id: LI-5011-3, type: EQUIPMENT, description: Rain cover, quantity: 1, unit_amount_minor: 200, amount_minor: 200 }
+                    - { line_item_id: LI-5011-4, type: LATE_RETURN_FEE, description: "Late return, 90 min (3 × 30 min)", quantity: 3, unit_amount_minor: 500, amount_minor: 1500 }
+                    - { line_item_id: LI-5011-5, type: DIFFERENT_HUB_FEE, description: "Return at HUB-02 instead of HUB-01", quantity: 1, unit_amount_minor: 800, amount_minor: 800 }
+                  total_minor: 5050
+                  issued_at: "2026-11-20T13:30:02Z"
+                  replaces_invoice_id: null
+                  credit_notes: []
+                  net_amount_minor: 5050
+                operations_followups:
+                  - { type: DIFFERENT_RETURN_HUB, reference: RNT-8812 }
+                  - { type: EQUIPMENT_DAMAGED, reference: EQ-RAIN-02 }
+                  - { type: LOW_BATTERY, reference: BIKE-402 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: "`INVALID_STATE_TRANSITION` (already returned), `IDEMPOTENCY_IN_PROGRESS`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: "`EQUIPMENT_NOT_ACCOUNTED_FOR`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /v1/rentals/{rentalId}/extensions:
+    parameters:
+      - $ref: '#/components/parameters/RentalId'
+    post:
+      tags: [Rentals]
+      operationId: extendRental
+      summary: Extend an active rental
+      description: |
+        **Roles:** rental owner (Resident / Org member); Hub operator assigned to the pickup or planned return hub.
+        Only while `ACTIVE` and before `due_at` (an `OVERDUE` rental cannot be extended retroactively → `409`).
+        The bike and all rented equipment must be free until `new_due_at` (allocation constraint → `409 ASSET_UNAVAILABLE`
+        if a following reservation, maintenance window or block exists). Extensions are records, so the history stays visible.
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RentalExtensionCreate' }
+            example: { new_due_at: "2026-11-20T13:00:00Z" }
+      responses:
+        '201':
+          description: Extended
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RentalExtension' }
+              example: { extension_id: EXT-55, rental_id: RNT-8812, previous_due_at: "2026-11-20T12:00:00Z", new_due_at: "2026-11-20T13:00:00Z", created_by: USR-1001, created_at: "2026-11-20T11:20:00Z" }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  # ───────────────────────────── Condition reports ─────────────────────────────
+  /v1/rentals/{rentalId}/condition-reports:
+    parameters:
+      - $ref: '#/components/parameters/RentalId'
+    get:
+      tags: [Condition reports]
+      operationId: listConditionReports
+      summary: List condition reports of a rental
+      description: "**Roles & scope:** as `GET /v1/rentals/{rentalId}`; Technician may read too (fault diagnosis)."
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, SUPPORT_AGENT, TECHNICIAN]
+      responses:
+        '200':
+          description: Reports, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/ConditionReport' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Condition reports]
+      operationId: addSupplementaryConditionReport
+      summary: Append a supplementary condition report
+      description: |
+        **Roles:** Hub operator assigned to the hub where the bike is now. `CHECKOUT` and `CHECKIN` reports are created only
+        by checkout/check-in; this endpoint creates `SUPPLEMENTARY` reports (e.g. damage noticed after the return).
+        Reports are append-only: no `PATCH`/`DELETE`. It never changes an already issued invoice.
+      x-roles: [HUB_OPERATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConditionReportInput' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConditionReport' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/condition-reports/{conditionReportId}:
+    parameters:
+      - name: conditionReportId
+        in: path
+        required: true
+        schema: { type: string }
+        example: CR-2
+    get:
+      tags: [Condition reports]
+      operationId: getConditionReport
+      summary: Get one condition report
+      description: "**Roles & scope:** as the parent rental; Technician may read."
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, SUPPORT_AGENT, TECHNICIAN]
+      responses:
+        '200':
+          description: Report
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConditionReport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Faults & maintenance ─────────────────────────────
+  /v1/faults:
+    get:
+      tags: [Faults & maintenance]
+      operationId: listFaults
+      summary: List faults
+      description: "**Roles:** Technician, Coordinator (all); Hub operator (bikes at assigned hubs)."
+      x-roles: [TECHNICIAN, OPS_COORDINATOR, HUB_OPERATOR]
+      parameters:
+        - { name: bike_id, in: query, schema: { type: string } }
+        - { name: hub_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/FaultStatus' } }
+        - { name: severity, in: query, schema: { $ref: '#/components/schemas/FaultSeverity' } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of faults
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FaultPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Faults & maintenance]
+      operationId: reportFault
+      summary: Report a fault
+      description: |
+        **Roles:** Technician; Hub operator (bike at an assigned hub or in a rental checked in there); Coordinator.
+        `CRITICAL` takes effect immediately in the same transaction: the bike leaves availability results and cannot be checked out.
+        Future reservations are reassigned or flagged (see Fault lifecycle). Does not change any reservation, rental or charge record.
+      x-roles: [TECHNICIAN, HUB_OPERATOR, OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FaultCreate' }
+            example: { bike_id: BIKE-402, severity: CRITICAL, category: BRAKES, description: Rear brake does not engage, attachment_ids: [ATT-80] }
+      responses:
+        '201':
+          description: Fault recorded
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Fault' }
+              example:
+                fault_id: FLT-301
+                bike_id: BIKE-402
+                severity: CRITICAL
+                category: BRAKES
+                description: Rear brake does not engage
+                status: REPORTED
+                reported_by: TEC-4
+                reported_at: "2026-11-21T07:40:00Z"
+                hub_id: HUB-02
+                affected_reservation_ids: [RES-9950]
+                bike_technical_status: CRITICAL_FAULT
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/faults/{faultId}:
+    parameters:
+      - $ref: '#/components/parameters/FaultId'
+    get:
+      tags: [Faults & maintenance]
+      operationId: getFault
+      summary: Get fault
+      description: "**Roles:** Technician, Coordinator; Hub operator (assigned hubs)."
+      x-roles: [TECHNICIAN, OPS_COORDINATOR, HUB_OPERATOR]
+      responses:
+        '200':
+          description: Fault
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Fault' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/faults/{faultId}/start-work:
+    parameters:
+      - $ref: '#/components/parameters/FaultId'
+    post:
+      tags: [Faults & maintenance]
+      operationId: startFaultWork
+      summary: "Transition REPORTED → IN_PROGRESS"
+      description: "**Roles:** Technician. Assigns the fault to the caller."
+      x-roles: [TECHNICIAN]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: In progress
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Fault' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/faults/{faultId}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/FaultId'
+    post:
+      tags: [Faults & maintenance]
+      operationId: resolveFault
+      summary: "Transition → RESOLVED"
+      description: |
+        **Roles:** Technician. Recalculates the bike's derived `technical_status` (other open faults, maintenance windows, blocks and battery still apply,
+        so the bike is **not** automatically "available"). Has no effect on historical condition reports, rentals, invoices or disputes.
+      x-roles: [TECHNICIAN]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FaultResolve' }
+            example: { resolution_type: FIXED, notes: Replaced rear brake cable and pads. }
+      responses:
+        '200':
+          description: Resolved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Fault' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/maintenance-windows:
+    get:
+      tags: [Faults & maintenance]
+      operationId: listMaintenanceWindows
+      summary: List maintenance windows
+      description: "**Roles:** Technician, Coordinator; Hub operator (assigned hubs)."
+      x-roles: [TECHNICIAN, OPS_COORDINATOR, HUB_OPERATOR]
+      parameters:
+        - { name: bike_id, in: query, schema: { type: string } }
+        - { name: hub_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [SCHEDULED, COMPLETED, CANCELLED] } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindowPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Faults & maintenance]
+      operationId: scheduleMaintenance
+      summary: Schedule a maintenance window
+      description: |
+        **Roles:** Technician, Coordinator. Writes an allocation for the bike (same exclusion constraint as reservations).
+        Overlapping reservation/rental → `409 ALLOCATION_CONFLICT` listing them. Only a Coordinator may pass
+        `displacement: REASSIGN_OR_CANCEL` (technicians cannot modify reservations → `403` if they try).
+      x-roles: [TECHNICIAN, OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MaintenanceWindowCreate' }
+            example: { bike_id: BIKE-12, start: "2026-12-08T06:00:00Z", end: "2026-12-08T15:00:00Z", reason: Annual motor service }
+      responses:
+        '201':
+          description: Scheduled
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Overlaps reservations/rentals/other windows
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://api.urbanmove.city/problems/allocation-conflict
+                title: Allocation conflict
+                status: 409
+                code: ALLOCATION_CONFLICT
+                detail: BIKE-12 has 1 reservation in the requested window. A coordinator can schedule with displacement.
+                conflicting_reservation_ids: [RES-9970]
+  /v1/maintenance-windows/{maintenanceWindowId}:
+    parameters:
+      - $ref: '#/components/parameters/MaintenanceWindowId'
+    get:
+      tags: [Faults & maintenance]
+      operationId: getMaintenanceWindow
+      summary: Get maintenance window
+      description: "**Roles:** Technician, Coordinator; Hub operator (assigned hubs)."
+      x-roles: [TECHNICIAN, OPS_COORDINATOR, HUB_OPERATOR]
+      responses:
+        '200':
+          description: Window
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/maintenance-windows/{maintenanceWindowId}/complete:
+    parameters:
+      - $ref: '#/components/parameters/MaintenanceWindowId'
+    post:
+      tags: [Faults & maintenance]
+      operationId: completeMaintenance
+      summary: "Transition SCHEDULED → COMPLETED (releases remaining time)"
+      description: "**Roles:** Technician."
+      x-roles: [TECHNICIAN]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                notes: { type: string, maxLength: 2000 }
+      responses:
+        '200':
+          description: Completed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/maintenance-windows/{maintenanceWindowId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/MaintenanceWindowId'
+    post:
+      tags: [Faults & maintenance]
+      operationId: cancelMaintenance
+      summary: "Transition SCHEDULED → CANCELLED"
+      description: "**Roles:** Technician, Coordinator. Displaced reservations are not restored automatically."
+      x-roles: [TECHNICIAN, OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MaintenanceWindow' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ───────────────────────────── Operations ─────────────────────────────
+  /v1/operational-blocks:
+    get:
+      tags: [Operations]
+      operationId: listOperationalBlocks
+      summary: List operational blocks
+      description: "**Roles:** Coordinator; Hub operator and Technician (read, for planning)."
+      x-roles: [OPS_COORDINATOR, HUB_OPERATOR, TECHNICIAN]
+      parameters:
+        - { name: hub_id, in: query, schema: { type: string } }
+        - { name: bike_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [ACTIVE, ENDED, CANCELLED] } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationalBlockPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Operations]
+      operationId: createOperationalBlock
+      summary: Block a hub or bike for an event
+      description: |
+        **Roles:** Operations coordinator. A hub block allocates every bike and equipment item of the hub for the period.
+        With `displacement: NONE` (default) any overlap → `409 ALLOCATION_CONFLICT`; with `REASSIGN_OR_CANCEL` affected
+        reservations are moved to an equivalent bike or cancelled free of charge (listed in the response).
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OperationalBlockCreate' }
+            example: { scope: HUB, hub_id: HUB-03, start: "2026-12-05T06:00:00Z", end: "2026-12-05T20:00:00Z", reason: Christmas market setup, displacement: REASSIGN_OR_CANCEL }
+      responses:
+        '201':
+          description: Block created
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationalBlock' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/operational-blocks/{blockId}:
+    parameters:
+      - $ref: '#/components/parameters/BlockId'
+    get:
+      tags: [Operations]
+      operationId: getOperationalBlock
+      summary: Get operational block
+      description: "**Roles:** Coordinator, Hub operator, Technician."
+      x-roles: [OPS_COORDINATOR, HUB_OPERATOR, TECHNICIAN]
+      responses:
+        '200':
+          description: Block
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationalBlock' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/operational-blocks/{blockId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/BlockId'
+    post:
+      tags: [Operations]
+      operationId: cancelOperationalBlock
+      summary: "Transition ACTIVE → CANCELLED (releases allocations)"
+      description: "**Roles:** Operations coordinator. Kept for audit rather than deleted. Displaced reservations are not restored."
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationalBlock' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/service-outages:
+    get:
+      tags: [Operations]
+      operationId: listServiceOutages
+      summary: List documented service outages
+      description: "**Roles:** any authenticated user (customers need the id to cancel free of charge). No personal data."
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, TECHNICIAN, SUPPORT_AGENT]
+      parameters:
+        - { name: hub_id, in: query, schema: { type: string } }
+        - { name: active_at, in: query, schema: { type: string, format: date-time } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceOutagePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Operations]
+      operationId: createServiceOutage
+      summary: Document a service outage
+      description: "**Roles:** Operations coordinator (the system also creates outages for unsubstitutable critical faults). Enables free late cancellation of covered reservations."
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceOutageCreate' }
+            example: { scope: HUB, hub_id: HUB-03, start: "2026-11-21T06:00:00Z", end: "2026-11-21T18:00:00Z", description: Power failure at hub charging station }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceOutage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/service-outages/{outageId}:
+    parameters:
+      - { name: outageId, in: path, required: true, schema: { type: string }, example: OUT-17 }
+    get:
+      tags: [Operations]
+      operationId: getServiceOutage
+      summary: Get service outage
+      description: "**Roles:** any authenticated user."
+      x-roles: [RESIDENT, ORG_MEMBER, HUB_OPERATOR, OPS_COORDINATOR, TECHNICIAN, SUPPORT_AGENT]
+      responses:
+        '200':
+          description: Outage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceOutage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Organisations ─────────────────────────────
+  /v1/organisations/{organisationId}:
+    parameters:
+      - { name: organisationId, in: path, required: true, schema: { type: string }, example: ORG-7 }
+    get:
+      tags: [Organisations]
+      operationId: getOrganisation
+      summary: Get organisation and its members
+      description: "**Roles:** Org member of this organisation (else 404); Coordinator; Support agent. Membership is managed in the identity provider."
+      x-roles: [ORG_MEMBER, OPS_COORDINATOR, SUPPORT_AGENT]
+      responses:
+        '200':
+          description: Organisation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organisation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Reservation requests ─────────────────────────────
+  /v1/reservation-requests:
+    get:
+      tags: [Reservation requests]
+      operationId: listReservationRequests
+      summary: List recurring reservation requests
+      description: "**Roles & scope:** Org member → requests of own organisation; Coordinator → all (filter by `status` for the approval inbox)."
+      x-roles: [ORG_MEMBER, OPS_COORDINATOR]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/ReservationRequestStatus' } }
+        - { name: organisation_id, in: query, schema: { type: string }, description: Coordinator only }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationRequestPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Reservation requests]
+      operationId: createReservationRequest
+      summary: Submit a recurring reservation request
+      description: |
+        **Roles:** Org member (organisation taken from the token). Creates **no** reservations and allocates nothing until approval.
+        Max 26 occurrences, max 10 bikes per occurrence.
+      x-roles: [ORG_MEMBER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationRequestCreate' }
+            example:
+              pickup_hub_id: HUB-04
+              planned_return_hub_id: HUB-04
+              bike_count: 3
+              requirements: { min_load_capacity_kg: 100 }
+              equipment_per_bike: [ { equipment_type: DELIVERY_CRATE, quantity: 1 } ]
+              recurrence: { frequency: WEEKLY, weekday: TUESDAY, start_local_time: "08:00", end_local_time: "12:00", time_zone: Europe/Berlin, first_date: "2026-11-24", occurrence_count: 6 }
+              purpose: Food bank deliveries
+      responses:
+        '201':
+          description: Submitted
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+  /v1/reservation-requests/{requestId}:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Reservation requests]
+      operationId: getReservationRequest
+      summary: Get request with fulfilment summary
+      description: "**Roles & scope:** Org member of the owning organisation (else 404); Coordinator."
+      x-roles: [ORG_MEMBER, OPS_COORDINATOR]
+      responses:
+        '200':
+          description: Request
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Reservation requests]
+      operationId: amendReservationRequest
+      summary: Edit a request (explicit effect on existing reservations)
+      description: |
+        **Roles:** Org member of the owning organisation.
+        * `SUBMITTED`: edited in place (no reservations exist yet); `effective_from` is ignored.
+        * `APPROVED`: requires `effective_from`. The request becomes `AMENDMENT_PENDING` and the amendment is stored in `pending_amendment`.
+          **Existing reservations stay valid until a coordinator decides.** On approval, every `CONFIRMED` reservation of this request with
+          start ≥ `effective_from` is cancelled (reason `ORGANISATION_REQUEST_CHANGE`, normal 24-hour fee rule) and new reservations are generated
+          for the amended pattern; reservations before `effective_from` and collected ones are never touched. On rejection nothing changes.
+        * Other states → `409 INVALID_STATE_TRANSITION`.
+      x-roles: [ORG_MEMBER]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationRequestAmend' }
+            example: { effective_from: "2026-12-15", bike_count: 2 }
+      responses:
+        '200':
+          description: Amended (SUBMITTED) or amendment pending (APPROVED → AMENDMENT_PENDING)
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '428': { $ref: '#/components/responses/PreconditionRequired' }
+  /v1/reservation-requests/{requestId}/occurrences:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Reservation requests]
+      operationId: listOccurrences
+      summary: List occurrences with their reservations and shortfalls
+      description: "**Roles & scope:** Org member of owning organisation; Coordinator."
+      x-roles: [ORG_MEMBER, OPS_COORDINATOR]
+      responses:
+        '200':
+          description: Occurrences, chronological
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Occurrence' } }
+              example:
+                items:
+                  - { occurrence_id: OCC-44-1, date: "2026-11-24", start: "2026-11-24T07:00:00Z", end: "2026-11-24T11:00:00Z", status: FULFILLED, bikes_requested: 3, bikes_allocated: 3, reservation_ids: [RES-1201, RES-1202, RES-1203], shortfall: [] }
+                  - { occurrence_id: OCC-44-3, date: "2026-12-08", start: "2026-12-08T07:00:00Z", end: "2026-12-08T11:00:00Z", status: PARTIALLY_FULFILLED, bikes_requested: 3, bikes_allocated: 2, reservation_ids: [RES-1207, RES-1208], shortfall: [ { count: 1, reason: MAINTENANCE_WINDOW, reference: MW-55 } ] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/reservation-requests/{requestId}/feasibility:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    get:
+      tags: [Reservation requests]
+      operationId: getRequestFeasibility
+      summary: "Read model: dry-run of approval (allocates nothing)"
+      description: "**Roles:** Coordinator; Org member of owning organisation. Computed now; may differ at approval time."
+      x-roles: [OPS_COORDINATOR, ORG_MEMBER]
+      responses:
+        '200':
+          description: Feasibility
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Feasibility' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/reservation-requests/{requestId}/approve:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Reservation requests]
+      operationId: approveReservationRequest
+      summary: "Approve request (SUBMITTED → APPROVED) or pending amendment (AMENDMENT_PENDING → APPROVED)"
+      description: |
+        **Roles:** Operations coordinator.
+        In one transaction generates individual `CONFIRMED` reservations (origin `ORGANISATION_REQUEST`) using the same eligibility rules
+        and allocation constraint as `POST /v1/reservations`. If any occurrence cannot be fully allocated and `allow_partial=false`
+        → `409 PARTIAL_FULFILMENT_NOT_ACCEPTED`, nothing created, state unchanged. With `allow_partial=true` the response lists the shortfall (W4).
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RequestApproval' }
+            example: { allow_partial: true, note: "Dec 8: 2 bikes only (maintenance)" }
+      responses:
+        '200':
+          description: Approved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalResult' }
+              example:
+                request_id: REQ-44
+                status: APPROVED
+                fulfilment: { occurrences_total: 6, bikes_requested_total: 18, reservations_created: 17, bikes_unfulfilled: 1 }
+                occurrences_href: /v1/reservation-requests/REQ-44/occurrences
+                unfulfilled:
+                  - { occurrence_id: OCC-44-3, date: "2026-12-08", bikes_requested: 3, bikes_allocated: 2, shortfall: [ { count: 1, reason: MAINTENANCE_WINDOW, reference: MW-55 } ] }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: "`PARTIAL_FULFILMENT_NOT_ACCEPTED` or `INVALID_STATE_TRANSITION`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://api.urbanmove.city/problems/partial-fulfilment-not-accepted
+                title: Request cannot be fully fulfilled
+                status: 409
+                code: PARTIAL_FULFILMENT_NOT_ACCEPTED
+                detail: 1 of 18 bikes cannot be allocated. Nothing was created. Approve with allow_partial=true or ask the organisation to amend.
+                instance: /v1/reservation-requests/REQ-44/approve
+                unfulfilled: [ { occurrence_id: OCC-44-3, date: "2026-12-08", bikes_requested: 3, bikes_allocated: 2, shortfall: [ { count: 1, reason: MAINTENANCE_WINDOW, reference: MW-55 } ] } ]
+  /v1/reservation-requests/{requestId}/reject:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Reservation requests]
+      operationId: rejectReservationRequest
+      summary: "Reject request (SUBMITTED → REJECTED) or amendment (AMENDMENT_PENDING → APPROVED, unchanged)"
+      description: "**Roles:** Operations coordinator. Reason required."
+      x-roles: [OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 3, maxLength: 1000 }
+            example: { reason: Hub capacity reserved for city event in that period. }
+      responses:
+        '200':
+          description: Rejected
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/reservation-requests/{requestId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RequestId'
+    post:
+      tags: [Reservation requests]
+      operationId: cancelReservationRequest
+      summary: Cancel/withdraw a request (explicit effect on existing reservations)
+      description: |
+        **Roles:** Org member of owning organisation; Coordinator.
+        * `SUBMITTED` → `CANCELLED` (withdrawal; no reservations exist).
+        * `APPROVED` / `AMENDMENT_PENDING` → `CANCELLED`: every `CONFIRMED` reservation of the request starting on/after `effective_from`
+          is cancelled. Each one follows the normal fee rule (free > 24 h before start, otherwise fee unless `service_outage_id`).
+          Reservations before `effective_from`, `CHECKED_OUT` reservations and running rentals are kept. The response lists every affected reservation and fee.
+      x-roles: [ORG_MEMBER, OPS_COORDINATOR]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RequestCancellation' }
+            example: { effective_from: "2026-12-08", comment: Programme ends early }
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestCancellationResult' }
+              example:
+                request_id: REQ-44
+                status: CANCELLED
+                cancelled_reservations:
+                  - { reservation_id: RES-1207, start: "2026-12-08T07:00:00Z", fee_minor: 0 }
+                  - { reservation_id: RES-1208, start: "2026-12-08T07:00:00Z", fee_minor: 0 }
+                kept_reservation_ids: [RES-1201, RES-1202, RES-1203, RES-1204, RES-1205, RES-1206]
+                currency: EUR
+                fee_invoice_id: null
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ───────────────────────────── Billing ─────────────────────────────
+  /v1/invoices:
+    get:
+      tags: [Billing]
+      operationId: listInvoices
+      summary: List invoices
+      description: |
+        **Roles & scope:** Resident → own; Org member → own + organisation's; Support agent → any (`customer_id` filter);
+        Coordinator → organisation invoices (read-only). **Technician and Hub operator → 403.**
+      x-roles: [RESIDENT, ORG_MEMBER, SUPPORT_AGENT, OPS_COORDINATOR]
+      parameters:
+        - { name: customer_id, in: query, schema: { type: string }, description: Staff only }
+        - { name: issued_from, in: query, schema: { type: string, format: date } }
+        - { name: issued_to, in: query, schema: { type: string, format: date } }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvoicePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/invoices/{invoiceId}:
+    parameters:
+      - $ref: '#/components/parameters/InvoiceId'
+    get:
+      tags: [Billing]
+      operationId: getInvoice
+      summary: Get an immutable invoice (JSON or PDF)
+      description: |
+        **Roles & scope:** owner Resident / Org member (organisation invoice); Support agent; Coordinator (organisation invoices).
+        Not owner → **404** (no existence leak). Technician/Hub operator → **403**.
+        There is no `PUT`/`PATCH`/`DELETE` on invoices (`405`). `credit_notes` and `net_amount_minor` are derived from linked documents;
+        the invoice content itself never changes. `ETag` is stable for the invoice content.
+      x-roles: [RESIDENT, ORG_MEMBER, SUPPORT_AGENT, OPS_COORDINATOR]
+      responses:
+        '200':
+          description: Invoice
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+              example:
+                invoice_id: INV-5011
+                invoice_number: UM-2026-005011
+                status: ISSUED
+                customer: { type: RESIDENT, id: USR-1001 }
+                source: { type: RENTAL, id: RNT-8812 }
+                currency: EUR
+                line_items:
+                  - { line_item_id: LI-5011-1, type: BASE_DURATION, description: "Cargo bike, 4 h 25 min (9 × 30 min)", quantity: 9, unit_amount_minor: 250, amount_minor: 2250 }
+                  - { line_item_id: LI-5011-2, type: EQUIPMENT, description: Child seat, quantity: 1, unit_amount_minor: 300, amount_minor: 300 }
+                  - { line_item_id: LI-5011-3, type: EQUIPMENT, description: Rain cover, quantity: 1, unit_amount_minor: 200, amount_minor: 200 }
+                  - { line_item_id: LI-5011-4, type: LATE_RETURN_FEE, description: "Late return, 90 min (3 × 30 min)", quantity: 3, unit_amount_minor: 500, amount_minor: 1500 }
+                  - { line_item_id: LI-5011-5, type: DIFFERENT_HUB_FEE, description: "Return at HUB-02 instead of HUB-01", quantity: 1, unit_amount_minor: 800, amount_minor: 800 }
+                total_minor: 5050
+                issued_at: "2026-11-20T13:30:02Z"
+                replaces_invoice_id: null
+                credit_notes: [ { credit_note_id: CN-902, amount_minor: 750, line_item_id: LI-5011-4, dispute_id: DSP-301, issued_at: "2026-11-24T10:12:00Z" } ]
+                net_amount_minor: 4300
+            application/pdf:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Role may never read invoices (e.g. Technician)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://api.urbanmove.city/problems/role-not-permitted
+                title: Role not permitted
+                status: 403
+                code: ROLE_NOT_PERMITTED
+                detail: Role TECHNICIAN has no access to billing documents.
+                instance: /v1/invoices/INV-5011
+        '404': { $ref: '#/components/responses/NotFound' }
+        '406':
+          description: Unsupported Accept header
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /v1/invoices/{invoiceId}/credit-notes:
+    parameters:
+      - $ref: '#/components/parameters/InvoiceId'
+    post:
+      tags: [Billing]
+      operationId: issueCreditNote
+      summary: Issue a goodwill/correction credit note without a dispute
+      description: |
+        **Roles:** Support agent only. Never modifies the invoice. Sum of credit notes ≤ invoice total (`422 CREDIT_EXCEEDS_INVOICE`).
+        For a completely wrong invoice: credit the full amount and create a replacement invoice (`replacement` block); the
+        replacement carries `replaces_invoice_id`. Disputed charges should be credited via `/v1/disputes/{id}/resolve` instead.
+      x-roles: [SUPPORT_AGENT]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreditNoteCreate' }
+            example: { amount_minor: 800, line_item_id: LI-5011-5, reason: Return hub was closed (OUT-17), settlement: ACCOUNT_CREDIT }
+      responses:
+        '201':
+          description: Credit note issued
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreditNote' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+  /v1/credit-notes/{creditNoteId}:
+    parameters:
+      - { name: creditNoteId, in: path, required: true, schema: { type: string }, example: CN-902 }
+    get:
+      tags: [Billing]
+      operationId: getCreditNote
+      summary: Get an immutable credit note
+      description: "**Roles & scope:** as the referenced invoice (owner → else 404; Technician → 403)."
+      x-roles: [RESIDENT, ORG_MEMBER, SUPPORT_AGENT, OPS_COORDINATOR]
+      responses:
+        '200':
+          description: Credit note
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreditNote' }
+            application/pdf:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ───────────────────────────── Disputes ─────────────────────────────
+  /v1/disputes:
+    get:
+      tags: [Disputes]
+      operationId: listDisputes
+      summary: List disputes
+      description: "**Roles & scope:** Resident / Org member → own; Support agent → all (work queue, filter `status`)."
+      x-roles: [RESIDENT, ORG_MEMBER, SUPPORT_AGENT]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/DisputeStatus' } }
+        - { name: invoice_id, in: query, schema: { type: string } }
+        - { name: assigned_to, in: query, schema: { type: string }, description: Support only }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page
+          headers:
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DisputePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Disputes]
+      operationId: openDispute
+      summary: Dispute a charge on an own invoice
+      description: |
+        **Roles:** Resident / Org member who can read the invoice (else 404). One open dispute per line item; within 60 days of issue.
+      x-roles: [RESIDENT, ORG_MEMBER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DisputeCreate' }
+            example:
+              invoice_id: INV-5011
+              line_item_id: LI-5011-4
+              disputed_amount_minor: 1500
+              reason_code: LATE_FEE_INCORRECT
+              explanation: I queued 40 minutes at HUB-02 before check-in.
+              attachment_ids: []
+      responses:
+        '201':
+          description: Dispute opened
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dispute' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: "`DISPUTE_ALREADY_OPEN`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: "`AMOUNT_EXCEEDS_LINE`, `DISPUTE_WINDOW_CLOSED`"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /v1/disputes/{disputeId}:
+    parameters:
+      - $ref: '#/components/parameters/DisputeId'
+    get:
+      tags: [Disputes]
+      operationId: getDispute
+      summary: Get dispute
+      description: "**Roles & scope:** owner (else 404); Support agent."
+      x-roles: [RESIDENT, ORG_MEMBER, SUPPORT_AGENT]
+      responses:
+        '200':
+          description: Dispute
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dispute' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/disputes/{disputeId}/start-review:
+    parameters:
+      - $ref: '#/components/parameters/DisputeId'
+    post:
+      tags: [Disputes]
+      operationId: startDisputeReview
+      summary: "Transition OPEN → UNDER_REVIEW (assigns to caller)"
+      description: "**Roles:** Support agent."
+      x-roles: [SUPPORT_AGENT]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Under review
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dispute' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/disputes/{disputeId}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/DisputeId'
+    post:
+      tags: [Disputes]
+      operationId: resolveDispute
+      summary: "Transition UNDER_REVIEW → RESOLVED; issues a credit note for any accepted amount"
+      description: |
+        **Roles:** Support agent (the assigned one). `ACCEPTED` → credit = disputed amount; `PARTIALLY_ACCEPTED` → 0 < credit < disputed;
+        `REJECTED` → no credit. The invoice is **not** modified; a `CreditNote` is created in the same transaction (W5).
+      x-roles: [SUPPORT_AGENT]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DisputeResolve' }
+            example: { decision: PARTIALLY_ACCEPTED, credit_amount_minor: 750, settlement: REFUND_TO_PAYMENT_METHOD, note: "Queue delay of 30 min verified; remaining 60 min late fee stands." }
+      responses:
+        '200':
+          description: Resolved
+          headers:
+            Idempotent-Replayed: { $ref: '#/components/headers/IdempotentReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dispute' }
+              example:
+                dispute_id: DSP-301
+                invoice_id: INV-5011
+                line_item_id: LI-5011-4
+                status: RESOLVED
+                reason_code: LATE_FEE_INCORRECT
+                explanation: I queued 40 minutes at HUB-02 before check-in.
+                disputed_amount_minor: 1500
+                currency: EUR
+                opened_by: USR-1001
+                opened_at: "2026-11-21T08:30:00Z"
+                assigned_to: SUP-3
+                resolution:
+                  decision: PARTIALLY_ACCEPTED
+                  credited_amount_minor: 750
+                  credit_note_id: CN-902
+                  settlement: REFUND_TO_PAYMENT_METHOD
+                  note: Queue delay of 30 min verified; remaining 60 min late fee stands.
+                  resolved_by: SUP-3
+                  resolved_at: "2026-11-24T10:12:00Z"
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: "`CREDIT_AMOUNT_INCONSISTENT` (e.g. PARTIALLY_ACCEPTED with credit ≥ disputed)"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /v1/disputes/{disputeId}/withdraw:
+    parameters:
+      - $ref: '#/components/parameters/DisputeId'
+    post:
+      tags: [Disputes]
+      operationId: withdrawDispute
+      summary: "Transition OPEN/UNDER_REVIEW → WITHDRAWN"
+      description: "**Roles:** dispute owner."
+      x-roles: [RESIDENT, ORG_MEMBER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Withdrawn
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dispute' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "OIDC access token. Claims: sub, roles[], organisation_id, assigned_hub_ids[]."
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID, one per user intent, reused on retries. Stored 24 h.
+      schema: { type: string, format: uuid }
+      example: 7b9e2a41-3d6f-4c81-a9e0-112233445566
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: ETag from the last GET; mismatch → 412, missing → 428.
+      schema: { type: string }
+      example: '"3"'
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from `next_cursor`.
+      schema: { type: string }
+    HubId:
+      { name: hubId, in: path, required: true, schema: { type: string }, example: HUB-01 }
+    BikeId:
+      { name: bikeId, in: path, required: true, schema: { type: string }, example: BIKE-402 }
+    EquipmentId:
+      { name: equipmentId, in: path, required: true, schema: { type: string }, example: EQ-RAIN-02 }
+    ReservationId:
+      { name: reservationId, in: path, required: true, schema: { type: string }, example: RES-9901 }
+    RentalId:
+      { name: rentalId, in: path, required: true, schema: { type: string }, example: RNT-8812 }
+    FaultId:
+      { name: faultId, in: path, required: true, schema: { type: string }, example: FLT-301 }
+    MaintenanceWindowId:
+      { name: maintenanceWindowId, in: path, required: true, schema: { type: string }, example: MW-55 }
+    BlockId:
+      { name: blockId, in: path, required: true, schema: { type: string }, example: BLK-9 }
+    RequestId:
+      { name: requestId, in: path, required: true, schema: { type: string }, example: REQ-44 }
+    InvoiceId:
+      { name: invoiceId, in: path, required: true, schema: { type: string }, example: INV-5011 }
+    DisputeId:
+      { name: disputeId, in: path, required: true, schema: { type: string }, example: DSP-301 }
+
+  headers:
+    Location:
+      description: URI of the created resource
+      schema: { type: string, format: uri-reference }
+    ETag:
+      description: Version tag for optimistic concurrency
+      schema: { type: string }
+    Link:
+      description: 'RFC 8288 pagination links, e.g. `</v1/reservations?cursor=abc>; rel="next"`'
+      schema: { type: string }
+    IdempotentReplayed:
+      description: "`true` when the response is a replay of a stored idempotent result"
+      schema: { type: boolean }
+
+  responses:
+    BadRequest:
+      description: Validation failed
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://api.urbanmove.city/problems/validation-failed
+            title: Validation failed
+            status: 400
+            code: VALIDATION_FAILED
+            detail: 2 fields are invalid.
+            instance: /v1/reservations
+            errors:
+              - { field: end, code: MUST_BE_AFTER_START, message: end must be after start }
+              - { field: "equipment_ids[1]", code: DUPLICATE, message: EQ-RAIN-02 listed twice }
+    Unauthorized:
+      description: Missing or invalid token
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+          example: Bearer error="invalid_token"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: https://api.urbanmove.city/problems/unauthenticated, title: Unauthenticated, status: 401, code: UNAUTHENTICATED }
+    Forbidden:
+      description: "Role not permitted (`ROLE_NOT_PERMITTED`) or hub not assigned (`HUB_NOT_ASSIGNED`)"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: https://api.urbanmove.city/problems/role-not-permitted, title: Role not permitted, status: 403, code: ROLE_NOT_PERMITTED, detail: Your role cannot perform this operation. }
+    NotFound:
+      description: Not found or not visible to the caller
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: https://api.urbanmove.city/problems/not-found, title: Not found, status: 404, code: NOT_FOUND, detail: Invoice INV-5011 was not found. }
+    Conflict:
+      description: Conflicts with current state
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: https://api.urbanmove.city/problems/invalid-state-transition, title: Invalid state transition, status: 409, code: INVALID_STATE_TRANSITION, detail: Dispute DSP-301 is RESOLVED; resolve is only allowed from UNDER_REVIEW., current_state: RESOLVED }
+    PreconditionFailed:
+      description: ETag mismatch
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: https://api.urbanmove.city/problems/etag-mismatch, title: Resource changed, status: 412, code: ETAG_MISMATCH, detail: Reload the resource and retry. }
+    PreconditionRequired:
+      description: If-Match missing
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: https://api.urbanmove.city/problems/if-match-required, title: If-Match required, status: 428, code: IF_MATCH_REQUIRED }
+    UnprocessableEntity:
+      description: Business rule violation
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: https://api.urbanmove.city/problems/business-rule-violation, title: Business rule violation, status: 422, code: BUSINESS_RULE_VIOLATION, detail: The requested change violates a business rule. }
+
+  schemas:
+    # ── common ──
+    Problem:
+      type: object
+      description: RFC 9457 problem details with UrbanMove extensions.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, description: Stable machine-readable error code }
+        trace_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              code: { type: string }
+              message: { type: string }
+      additionalProperties: true
+    GeoPoint:
+      type: object
+      required: [lat, lng]
+      properties:
+        lat: { type: number, format: double }
+        lng: { type: number, format: double }
+    CustomerRef:
+      type: object
+      properties:
+        type: { type: string, enum: [RESIDENT, ORGANISATION] }
+        id: { type: string }
+    Requirements:
+      type: object
+      properties:
+        min_load_capacity_kg: { type: integer, minimum: 0 }
+        accessibility_features: { type: array, items: { $ref: '#/components/schemas/AccessibilityFeature' } }
+        min_range_km: { type: integer, minimum: 0 }
+    EquipmentRef:
+      type: object
+      properties:
+        equipment_id: { type: string }
+        equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+
+    # ── enums ──
+    HubStatus: { type: string, enum: [ACTIVE, INACTIVE] }
+    BikeType: { type: string, enum: [LONG_JOHN, LONGTAIL, TRIKE, HEAVY_TRIKE] }
+    AccessibilityFeature: { type: string, enum: [STEP_THROUGH_FRAME, LOW_LOADING_DECK, TRICYCLE_STABILITY, HAND_CONTROLS, LOW_SEAT] }
+    TechnicalStatus:
+      type: string
+      description: Derived, read-only.
+      enum: [OPERATIONAL, CRITICAL_FAULT, IN_MAINTENANCE, RETIRED]
+    UnavailabilityReason: { type: string, enum: [OPEN_CRITICAL_FAULT, MAINTENANCE_WINDOW, LOW_BATTERY, OPERATIONAL_BLOCK, IN_RENTAL, RESERVED, RETIRED] }
+    EquipmentType: { type: string, enum: [CHILD_SEAT, RAIN_COVER, DELIVERY_CRATE, CARGO_NET] }
+    EquipmentStatus: { type: string, enum: [AVAILABLE, IN_USE, DAMAGED, MISSING, RETIRED] }
+    ReservationStatus: { type: string, enum: [CONFIRMED, CHECKED_OUT, EXPIRED, CANCELLED] }
+    RentalStatus: { type: string, enum: [ACTIVE, OVERDUE, RETURNED] }
+    RentalFlag: { type: string, enum: [LATE_RETURN, DIFFERENT_RETURN_HUB, EQUIPMENT_DAMAGED, EQUIPMENT_MISSING, BIKE_DAMAGED, SUBSTITUTE_BIKE] }
+    FaultStatus: { type: string, enum: [REPORTED, IN_PROGRESS, RESOLVED] }
+    FaultSeverity: { type: string, enum: [CRITICAL, MAJOR, MINOR] }
+    ReservationRequestStatus: { type: string, enum: [SUBMITTED, APPROVED, AMENDMENT_PENDING, REJECTED, CANCELLED, COMPLETED] }
+    DisputeStatus: { type: string, enum: [OPEN, UNDER_REVIEW, RESOLVED, WITHDRAWN] }
+    Displacement:
+      type: string
+      enum: [NONE, REASSIGN_OR_CANCEL]
+      default: NONE
+      description: "`REASSIGN_OR_CANCEL` only for OPS_COORDINATOR."
+
+    # ── profile ──
+    Me:
+      type: object
+      properties:
+        user_id: { type: string, example: USR-1001 }
+        display_name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        roles: { type: array, items: { type: string } }
+        organisation_id: { type: string, nullable: true }
+        assigned_hub_ids: { type: array, items: { type: string } }
+        active_reservation_count: { type: integer, description: "Personal CONFIRMED reservations (max 2)" }
+    MePatch:
+      type: object
+      minProperties: 1
+      properties:
+        display_name: { type: string, maxLength: 80 }
+        email: { type: string, format: email }
+        phone: { type: string, maxLength: 30 }
+    Attachment:
+      type: object
+      properties:
+        attachment_id: { type: string, example: ATT-77 }
+        content_type: { type: string }
+        size_bytes: { type: integer }
+        uploaded_by: { type: string }
+        uploaded_at: { type: string, format: date-time }
+        href: { type: string }
+    Organisation:
+      type: object
+      properties:
+        organisation_id: { type: string }
+        name: { type: string }
+        members:
+          type: array
+          items:
+            type: object
+            properties:
+              user_id: { type: string }
+              display_name: { type: string }
+
+    # ── hubs & fleet ──
+    Hub:
+      type: object
+      properties:
+        hub_id: { type: string }
+        name: { type: string }
+        address: { type: string }
+        location: { $ref: '#/components/schemas/GeoPoint' }
+        status: { $ref: '#/components/schemas/HubStatus' }
+        opening_hours: { type: string }
+        parking_slots: { type: integer }
+        created_at: { type: string, format: date-time }
+    HubCreate:
+      type: object
+      required: [name, address, location]
+      properties:
+        name: { type: string, maxLength: 100 }
+        address: { type: string }
+        location: { $ref: '#/components/schemas/GeoPoint' }
+        opening_hours: { type: string }
+        parking_slots: { type: integer, minimum: 1 }
+    HubPatch:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string }
+        address: { type: string }
+        location: { $ref: '#/components/schemas/GeoPoint' }
+        opening_hours: { type: string }
+        parking_slots: { type: integer, minimum: 1 }
+        status: { $ref: '#/components/schemas/HubStatus' }
+    HubPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Hub' } }
+        next_cursor: { type: string, nullable: true }
+    Bike:
+      type: object
+      properties:
+        bike_id: { type: string }
+        bike_type: { $ref: '#/components/schemas/BikeType' }
+        model: { type: string }
+        load_capacity_kg: { type: integer }
+        accessibility_features: { type: array, items: { $ref: '#/components/schemas/AccessibilityFeature' } }
+        battery_pct: { type: integer, minimum: 0, maximum: 100, readOnly: true }
+        estimated_range_km: { type: integer, readOnly: true }
+        current_hub_id: { type: string, nullable: true, description: null while rented }
+        technical_status: { $ref: '#/components/schemas/TechnicalStatus' }
+        bookable_now: { type: boolean, readOnly: true }
+        unavailability_reasons: { type: array, items: { $ref: '#/components/schemas/UnavailabilityReason' } }
+        open_fault_ids: { type: array, items: { type: string } }
+        updated_at: { type: string, format: date-time }
+    BikeCreate:
+      type: object
+      required: [bike_type, model, load_capacity_kg, hub_id]
+      properties:
+        bike_type: { $ref: '#/components/schemas/BikeType' }
+        model: { type: string }
+        load_capacity_kg: { type: integer, minimum: 1 }
+        accessibility_features: { type: array, items: { $ref: '#/components/schemas/AccessibilityFeature' } }
+        hub_id: { type: string }
+    BikePatch:
+      type: object
+      minProperties: 1
+      properties:
+        model: { type: string }
+        load_capacity_kg: { type: integer, minimum: 1 }
+        accessibility_features: { type: array, items: { $ref: '#/components/schemas/AccessibilityFeature' } }
+        hub_id: { type: string, description: Relocation }
+        retired: { type: boolean }
+    BikePage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Bike' } }
+        next_cursor: { type: string, nullable: true }
+    Equipment:
+      type: object
+      properties:
+        equipment_id: { type: string }
+        equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+        label: { type: string }
+        hub_id: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/EquipmentStatus' }
+        updated_at: { type: string, format: date-time }
+    EquipmentCreate:
+      type: object
+      required: [equipment_type, hub_id]
+      properties:
+        equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+        hub_id: { type: string }
+        label: { type: string }
+    EquipmentPatch:
+      type: object
+      minProperties: 1
+      properties:
+        hub_id: { type: string }
+        status: { type: string, enum: [AVAILABLE, RETIRED] }
+        label: { type: string }
+    EquipmentPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Equipment' } }
+        next_cursor: { type: string, nullable: true }
+
+    # ── availability views ──
+    HubAvailabilitySummary:
+      type: object
+      properties:
+        hub_id: { type: string }
+        name: { type: string }
+        location: { $ref: '#/components/schemas/GeoPoint' }
+        distance_km: { type: number }
+        window:
+          type: object
+          properties:
+            start: { type: string, format: date-time }
+            end: { type: string, format: date-time }
+        bikes_available:
+          type: array
+          items:
+            type: object
+            properties:
+              bike_type: { $ref: '#/components/schemas/BikeType' }
+              count: { type: integer }
+        equipment_available:
+          type: array
+          items:
+            type: object
+            properties:
+              equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+              count: { type: integer }
+    HubAvailabilitySummaryPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/HubAvailabilitySummary' } }
+        next_cursor: { type: string, nullable: true }
+    EligibleBikesResult:
+      type: object
+      properties:
+        hub_id: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        is_binding: { type: boolean, enum: [false] }
+        generated_at: { type: string, format: date-time }
+        bikes:
+          type: array
+          items:
+            type: object
+            properties:
+              bike_id: { type: string }
+              bike_type: { $ref: '#/components/schemas/BikeType' }
+              model: { type: string }
+              load_capacity_kg: { type: integer }
+              accessibility_features: { type: array, items: { $ref: '#/components/schemas/AccessibilityFeature' } }
+              battery_pct: { type: integer }
+              estimated_range_km: { type: integer }
+              price_estimate_minor: { type: integer }
+              currency: { type: string }
+        equipment: { type: array, items: { $ref: '#/components/schemas/EquipmentRef' } }
+
+    # ── reservations ──
+    ReservationCreate:
+      type: object
+      required: [bike_id, pickup_hub_id, start, end]
+      properties:
+        bike_id: { type: string }
+        pickup_hub_id: { type: string }
+        planned_return_hub_id: { type: string, description: Defaults to pickup hub }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        equipment_ids: { type: array, maxItems: 4, uniqueItems: true, items: { type: string } }
+        requirements: { $ref: '#/components/schemas/Requirements' }
+    Reservation:
+      type: object
+      properties:
+        reservation_id: { type: string }
+        status: { $ref: '#/components/schemas/ReservationStatus' }
+        origin: { type: string, enum: [INDIVIDUAL, ORGANISATION_REQUEST] }
+        customer: { $ref: '#/components/schemas/CustomerRef' }
+        booked_by: { type: string }
+        request_id: { type: string, nullable: true }
+        occurrence_id: { type: string, nullable: true }
+        bike_id: { type: string }
+        pickup_hub_id: { type: string }
+        planned_return_hub_id: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        collect_by: { type: string, format: date-time, description: start + 15 min }
+        free_cancellation_until: { type: string, format: date-time }
+        equipment: { type: array, items: { $ref: '#/components/schemas/EquipmentRef' } }
+        requirements: { $ref: '#/components/schemas/Requirements' }
+        rental_id: { type: string, nullable: true }
+        cancellation:
+          type: object
+          nullable: true
+          properties:
+            cancelled_at: { type: string, format: date-time }
+            cancelled_by: { type: string }
+            reason: { type: string, enum: [CUSTOMER_REQUEST, SERVICE_OUTAGE, ORGANISATION_REQUEST_CHANGE, OPERATIONAL_DISPLACEMENT] }
+            late: { type: boolean }
+            service_outage_id: { type: string, nullable: true }
+            fee_minor: { type: integer }
+            currency: { type: string }
+            fee_invoice_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        links: { type: object, additionalProperties: { type: string } }
+    ReservationPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Reservation' } }
+        next_cursor: { type: string, nullable: true }
+    ReservationCancel:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string, enum: [CUSTOMER_REQUEST, SERVICE_OUTAGE] }
+        service_outage_id: { type: string, description: Required when reason = SERVICE_OUTAGE }
+        comment: { type: string, maxLength: 500 }
+    AllowedAction:
+      type: object
+      properties:
+        action: { type: string, enum: [CANCEL, EXTEND_RENTAL, OPEN_DISPUTE, VIEW_INVOICE] }
+        method: { type: string }
+        href: { type: string }
+        fee_preview_minor: { type: integer, nullable: true }
+        note: { type: string }
+    Charges:
+      type: object
+      properties:
+        currency: { type: string }
+        estimated_total_minor: { type: integer, nullable: true, description: While the rental is running }
+        invoices:
+          type: array
+          items:
+            type: object
+            properties:
+              invoice_id: { type: string }
+              total_minor: { type: integer }
+              net_amount_minor: { type: integer }
+              issued_at: { type: string, format: date-time }
+        credit_notes: { type: array, items: { $ref: '#/components/schemas/CreditNoteSummary' } }
+        open_dispute_ids: { type: array, items: { type: string } }
+    ReservationDetail:
+      allOf:
+        - $ref: '#/components/schemas/Reservation'
+        - type: object
+          properties:
+            bike:
+              type: object
+              properties:
+                bike_id: { type: string }
+                bike_type: { $ref: '#/components/schemas/BikeType' }
+                model: { type: string }
+                load_capacity_kg: { type: integer }
+            rental:
+              type: object
+              nullable: true
+              properties:
+                rental_id: { type: string }
+                status: { $ref: '#/components/schemas/RentalStatus' }
+                started_at: { type: string, format: date-time }
+                due_at: { type: string, format: date-time }
+                returned_at: { type: string, format: date-time, nullable: true }
+                return_hub_id: { type: string, nullable: true }
+                flags: { type: array, items: { $ref: '#/components/schemas/RentalFlag' } }
+            condition_reports: { type: array, items: { $ref: '#/components/schemas/ConditionReport' } }
+            charges: { $ref: '#/components/schemas/Charges' }
+            allowed_actions: { type: array, items: { $ref: '#/components/schemas/AllowedAction' } }
+
+    # ── rentals ──
+    IdentityCheck:
+      type: object
+      required: [method, verified]
+      properties:
+        method: { type: string, enum: [ID_CARD, PASSPORT, DRIVING_LICENCE, RESIDENCE_PERMIT, APP_QR] }
+        verified: { type: boolean, description: Must be true }
+        document_reference_last4: { type: string, maxLength: 4, description: No full document numbers are stored }
+    ConditionReportInput:
+      type: object
+      required: [battery_pct, bike_condition, equipment]
+      properties:
+        battery_pct: { type: integer, minimum: 0, maximum: 100 }
+        bike_condition: { type: string, enum: [GOOD, MINOR_WEAR, DAMAGED] }
+        notes: { type: string, maxLength: 2000 }
+        attachment_ids: { type: array, items: { type: string } }
+        equipment:
+          type: array
+          description: Every rented equipment item must be listed
+          items:
+            type: object
+            required: [equipment_id, status]
+            properties:
+              equipment_id: { type: string }
+              status: { type: string, enum: [OK, DAMAGED, MISSING] }
+              notes: { type: string }
+              attachment_ids: { type: array, items: { type: string } }
+    ConditionReport:
+      allOf:
+        - type: object
+          properties:
+            condition_report_id: { type: string }
+            rental_id: { type: string }
+            kind: { type: string, enum: [CHECKOUT, CHECKIN, SUPPLEMENTARY] }
+            recorded_at: { type: string, format: date-time }
+            recorded_by: { type: string }
+            hub_id: { type: string }
+        - $ref: '#/components/schemas/ConditionReportInput'
+    CheckoutRequest:
+      type: object
+      required: [hub_id, identity_check, condition_report]
+      description: "Either `reservation_id`, or (`customer_id`, `bike_id`, `due_at`) for a walk-in."
+      properties:
+        reservation_id: { type: string }
+        customer_id: { type: string }
+        hub_id: { type: string }
+        bike_id: { type: string, description: Walk-in bike, or substitute for a reservation }
+        due_at: { type: string, format: date-time }
+        planned_return_hub_id: { type: string }
+        equipment_ids: { type: array, items: { type: string } }
+        identity_check: { $ref: '#/components/schemas/IdentityCheck' }
+        condition_report: { $ref: '#/components/schemas/ConditionReportInput' }
+    CheckinRequest:
+      type: object
+      required: [return_hub_id, condition_report]
+      properties:
+        return_hub_id: { type: string }
+        condition_report: { $ref: '#/components/schemas/ConditionReportInput' }
+    Rental:
+      type: object
+      properties:
+        rental_id: { type: string }
+        status: { $ref: '#/components/schemas/RentalStatus' }
+        reservation_id: { type: string, nullable: true }
+        customer: { $ref: '#/components/schemas/CustomerRef' }
+        bike_id: { type: string }
+        pickup_hub_id: { type: string }
+        planned_return_hub_id: { type: string }
+        return_hub_id: { type: string, nullable: true }
+        started_at: { type: string, format: date-time }
+        due_at: { type: string, format: date-time }
+        returned_at: { type: string, format: date-time, nullable: true }
+        equipment: { type: array, items: { $ref: '#/components/schemas/EquipmentRef' } }
+        flags: { type: array, items: { $ref: '#/components/schemas/RentalFlag' } }
+        checked_out_by: { type: string }
+        checked_in_by: { type: string, nullable: true }
+        extensions: { type: array, items: { $ref: '#/components/schemas/RentalExtension' } }
+        condition_report_ids: { type: array, items: { type: string } }
+        invoice_id: { type: string, nullable: true }
+    RentalPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Rental' } }
+        next_cursor: { type: string, nullable: true }
+    RentalDetail:
+      allOf:
+        - $ref: '#/components/schemas/Rental'
+        - type: object
+          properties:
+            condition_reports: { type: array, items: { $ref: '#/components/schemas/ConditionReport' } }
+            charges: { $ref: '#/components/schemas/Charges' }
+            allowed_actions: { type: array, items: { $ref: '#/components/schemas/AllowedAction' } }
+    CheckinResult:
+      type: object
+      properties:
+        rental: { $ref: '#/components/schemas/Rental' }
+        invoice: { $ref: '#/components/schemas/Invoice' }
+        operations_followups:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [DIFFERENT_RETURN_HUB, EQUIPMENT_DAMAGED, EQUIPMENT_MISSING, BIKE_DAMAGED, LOW_BATTERY] }
+              reference: { type: string }
+    RentalExtensionCreate:
+      type: object
+      required: [new_due_at]
+      properties:
+        new_due_at: { type: string, format: date-time }
+    RentalExtension:
+      type: object
+      properties:
+        extension_id: { type: string }
+        rental_id: { type: string }
+        previous_due_at: { type: string, format: date-time }
+        new_due_at: { type: string, format: date-time }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    # ── faults, maintenance, operations ──
+    FaultCreate:
+      type: object
+      required: [bike_id, severity, category, description]
+      properties:
+        bike_id: { type: string }
+        severity: { $ref: '#/components/schemas/FaultSeverity' }
+        category: { type: string, enum: [BRAKES, BATTERY, MOTOR, FRAME, TYRES, LIGHTS, ELECTRONICS, OTHER] }
+        description: { type: string, maxLength: 2000 }
+        rental_id: { type: string }
+        condition_report_id: { type: string }
+        related_fault_id: { type: string }
+        attachment_ids: { type: array, items: { type: string } }
+    Fault:
+      type: object
+      properties:
+        fault_id: { type: string }
+        bike_id: { type: string }
+        severity: { $ref: '#/components/schemas/FaultSeverity' }
+        category: { type: string }
+        description: { type: string }
+        status: { $ref: '#/components/schemas/FaultStatus' }
+        reported_by: { type: string }
+        reported_at: { type: string, format: date-time }
+        hub_id: { type: string, nullable: true }
+        assigned_to: { type: string, nullable: true }
+        affected_reservation_ids: { type: array, items: { type: string } }
+        bike_technical_status: { $ref: '#/components/schemas/TechnicalStatus' }
+        resolution:
+          type: object
+          nullable: true
+          properties:
+            resolution_type: { type: string, enum: [FIXED, NOT_REPRODUCIBLE, DUPLICATE] }
+            notes: { type: string }
+            resolved_by: { type: string }
+            resolved_at: { type: string, format: date-time }
+    FaultResolve:
+      type: object
+      required: [resolution_type]
+      properties:
+        resolution_type: { type: string, enum: [FIXED, NOT_REPRODUCIBLE, DUPLICATE] }
+        notes: { type: string, maxLength: 2000 }
+        duplicate_of_fault_id: { type: string }
+    FaultPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Fault' } }
+        next_cursor: { type: string, nullable: true }
+    MaintenanceWindowCreate:
+      type: object
+      required: [bike_id, start, end, reason]
+      properties:
+        bike_id: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        reason: { type: string }
+        fault_id: { type: string }
+        displacement: { $ref: '#/components/schemas/Displacement' }
+    MaintenanceWindow:
+      type: object
+      properties:
+        maintenance_window_id: { type: string }
+        bike_id: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        reason: { type: string }
+        fault_id: { type: string, nullable: true }
+        status: { type: string, enum: [SCHEDULED, COMPLETED, CANCELLED] }
+        created_by: { type: string }
+        displaced_reservations: { $ref: '#/components/schemas/DisplacedReservations' }
+    MaintenanceWindowPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/MaintenanceWindow' } }
+        next_cursor: { type: string, nullable: true }
+    DisplacedReservations:
+      type: array
+      items:
+        type: object
+        properties:
+          reservation_id: { type: string }
+          outcome: { type: string, enum: [REASSIGNED, CANCELLED_FREE] }
+          new_bike_id: { type: string, nullable: true }
+    OperationalBlockCreate:
+      type: object
+      required: [scope, start, end, reason]
+      properties:
+        scope: { type: string, enum: [HUB, BIKE] }
+        hub_id: { type: string }
+        bike_id: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        reason: { type: string }
+        displacement: { $ref: '#/components/schemas/Displacement' }
+    OperationalBlock:
+      type: object
+      properties:
+        block_id: { type: string }
+        scope: { type: string, enum: [HUB, BIKE] }
+        hub_id: { type: string, nullable: true }
+        bike_id: { type: string, nullable: true }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        reason: { type: string }
+        status: { type: string, enum: [ACTIVE, ENDED, CANCELLED] }
+        created_by: { type: string }
+        displaced_reservations: { $ref: '#/components/schemas/DisplacedReservations' }
+    OperationalBlockPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/OperationalBlock' } }
+        next_cursor: { type: string, nullable: true }
+    ServiceOutageCreate:
+      type: object
+      required: [scope, start, end, description]
+      properties:
+        scope: { type: string, enum: [NETWORK, HUB, BIKE] }
+        hub_id: { type: string }
+        bike_id: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        description: { type: string }
+    ServiceOutage:
+      allOf:
+        - type: object
+          properties:
+            outage_id: { type: string }
+            created_by: { type: string, description: Coordinator id or SYSTEM }
+            created_at: { type: string, format: date-time }
+        - $ref: '#/components/schemas/ServiceOutageCreate'
+    ServiceOutagePage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ServiceOutage' } }
+        next_cursor: { type: string, nullable: true }
+
+    # ── operator queue ──
+    OperatorQueue:
+      type: object
+      properties:
+        hub_id: { type: string }
+        date: { type: string, format: date }
+        generated_at: { type: string, format: date-time }
+        planned_pickups:
+          type: array
+          items:
+            type: object
+            properties:
+              reservation_id: { type: string }
+              start: { type: string, format: date-time }
+              collect_by: { type: string, format: date-time }
+              customer_display_name: { type: string }
+              bike_id: { type: string }
+              equipment_types: { type: array, items: { $ref: '#/components/schemas/EquipmentType' } }
+              origin: { type: string }
+              at_risk: { type: boolean, description: Reserved bike is no longer checkoutable }
+        expected_returns:
+          type: array
+          items:
+            type: object
+            properties:
+              rental_id: { type: string }
+              due_at: { type: string, format: date-time }
+              bike_id: { type: string }
+              customer_display_name: { type: string }
+              pickup_hub_id: { type: string }
+        overdue_rentals:
+          type: array
+          items:
+            type: object
+            properties:
+              rental_id: { type: string }
+              due_at: { type: string, format: date-time }
+              minutes_overdue: { type: integer }
+              bike_id: { type: string }
+              customer_display_name: { type: string }
+              pickup_hub_id: { type: string }
+              planned_return_hub_id: { type: string }
+        bikes_needing_attention:
+          type: array
+          items:
+            type: object
+            properties:
+              bike_id: { type: string }
+              reasons: { type: array, items: { type: string, enum: [OPEN_CRITICAL_FAULT, OPEN_FAULT, LOW_BATTERY, MAINTENANCE_TODAY, RETURNED_FROM_OTHER_HUB, DAMAGE_REPORTED] } }
+              battery_pct: { type: integer }
+              open_fault_ids: { type: array, items: { type: string } }
+              bookable: { type: boolean }
+        equipment_needing_attention:
+          type: array
+          items:
+            type: object
+            properties:
+              equipment_id: { type: string }
+              equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+              status: { $ref: '#/components/schemas/EquipmentStatus' }
+
+    # ── reservation requests ──
+    Recurrence:
+      type: object
+      required: [frequency, weekday, start_local_time, end_local_time, time_zone, first_date, occurrence_count]
+      properties:
+        frequency: { type: string, enum: [WEEKLY] }
+        weekday: { type: string, enum: [MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY] }
+        start_local_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+        end_local_time: { type: string, pattern: '^\d{2}:\d{2}$' }
+        time_zone: { type: string, example: Europe/Berlin }
+        first_date: { type: string, format: date }
+        occurrence_count: { type: integer, minimum: 1, maximum: 26 }
+    ReservationRequestCreate:
+      type: object
+      required: [pickup_hub_id, bike_count, recurrence]
+      properties:
+        pickup_hub_id: { type: string }
+        planned_return_hub_id: { type: string }
+        bike_count: { type: integer, minimum: 1, maximum: 10 }
+        requirements: { $ref: '#/components/schemas/Requirements' }
+        equipment_per_bike:
+          type: array
+          items:
+            type: object
+            properties:
+              equipment_type: { $ref: '#/components/schemas/EquipmentType' }
+              quantity: { type: integer, minimum: 1 }
+        recurrence: { $ref: '#/components/schemas/Recurrence' }
+        purpose: { type: string, maxLength: 500 }
+    ReservationRequestAmend:
+      type: object
+      minProperties: 1
+      properties:
+        effective_from: { type: string, format: date, description: Required when the request is APPROVED }
+        bike_count: { type: integer, minimum: 1, maximum: 10 }
+        requirements: { $ref: '#/components/schemas/Requirements' }
+        start_local_time: { type: string }
+        end_local_time: { type: string }
+        occurrence_count: { type: integer, minimum: 1, maximum: 26 }
+    Fulfilment:
+      type: object
+      properties:
+        occurrences_total: { type: integer }
+        bikes_requested_total: { type: integer }
+        reservations_created: { type: integer }
+        bikes_unfulfilled: { type: integer }
+    Shortfall:
+      type: object
+      properties:
+        count: { type: integer }
+        reason: { type: string, enum: [MAINTENANCE_WINDOW, OPERATIONAL_BLOCK, CRITICAL_FAULT, INSUFFICIENT_FLEET, ALREADY_RESERVED] }
+        reference: { type: string, nullable: true }
+    Occurrence:
+      type: object
+      properties:
+        occurrence_id: { type: string }
+        date: { type: string, format: date }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        status: { type: string, enum: [PENDING, FULFILLED, PARTIALLY_FULFILLED, UNFULFILLED, CANCELLED] }
+        bikes_requested: { type: integer }
+        bikes_allocated: { type: integer }
+        reservation_ids: { type: array, items: { type: string } }
+        shortfall: { type: array, items: { $ref: '#/components/schemas/Shortfall' } }
+    ReservationRequest:
+      allOf:
+        - type: object
+          properties:
+            request_id: { type: string }
+            organisation_id: { type: string }
+            created_by: { type: string }
+            status: { $ref: '#/components/schemas/ReservationRequestStatus' }
+            fulfilment: { $ref: '#/components/schemas/Fulfilment' }
+            decision:
+              type: object
+              nullable: true
+              properties:
+                decided_by: { type: string }
+                decided_at: { type: string, format: date-time }
+                note: { type: string }
+            pending_amendment: { $ref: '#/components/schemas/ReservationRequestAmend' }
+            created_at: { type: string, format: date-time }
+        - $ref: '#/components/schemas/ReservationRequestCreate'
+    ReservationRequestPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ReservationRequest' } }
+        next_cursor: { type: string, nullable: true }
+    Feasibility:
+      type: object
+      properties:
+        request_id: { type: string }
+        evaluated_at: { type: string, format: date-time }
+        fully_feasible: { type: boolean }
+        occurrences: { type: array, items: { $ref: '#/components/schemas/Occurrence' } }
+    RequestApproval:
+      type: object
+      required: [allow_partial]
+      properties:
+        allow_partial: { type: boolean }
+        note: { type: string, maxLength: 1000 }
+    ApprovalResult:
+      type: object
+      properties:
+        request_id: { type: string }
+        status: { $ref: '#/components/schemas/ReservationRequestStatus' }
+        fulfilment: { $ref: '#/components/schemas/Fulfilment' }
+        occurrences_href: { type: string }
+        unfulfilled: { type: array, items: { $ref: '#/components/schemas/Occurrence' } }
+        replaced_reservation_ids: { type: array, items: { type: string }, description: Only for amendment approvals }
+    RequestCancellation:
+      type: object
+      properties:
+        effective_from: { type: string, format: date, description: Defaults to today }
+        service_outage_id: { type: string }
+        comment: { type: string }
+    RequestCancellationResult:
+      type: object
+      properties:
+        request_id: { type: string }
+        status: { $ref: '#/components/schemas/ReservationRequestStatus' }
+        cancelled_reservations:
+          type: array
+          items:
+            type: object
+            properties:
+              reservation_id: { type: string }
+              start: { type: string, format: date-time }
+              fee_minor: { type: integer }
+        kept_reservation_ids: { type: array, items: { type: string } }
+        currency: { type: string }
+        fee_invoice_id: { type: string, nullable: true }
+
+    # ── billing ──
+    LineItem:
+      type: object
+      properties:
+        line_item_id: { type: string }
+        type: { type: string, enum: [BASE_DURATION, EQUIPMENT, LATE_RETURN_FEE, DIFFERENT_HUB_FEE, CANCELLATION_FEE, NO_SHOW_FEE, DAMAGE_FEE] }
+        description: { type: string }
+        quantity: { type: integer }
+        unit_amount_minor: { type: integer }
+        amount_minor: { type: integer }
+    CreditNoteSummary:
+      type: object
+      properties:
+        credit_note_id: { type: string }
+        amount_minor: { type: integer }
+        line_item_id: { type: string, nullable: true }
+        dispute_id: { type: string, nullable: true }
+        issued_at: { type: string, format: date-time }
+    Invoice:
+      type: object
+      description: Immutable once issued. `credit_notes` and `net_amount_minor` are derived from linked documents.
+      properties:
+        invoice_id: { type: string }
+        invoice_number: { type: string }
+        status: { type: string, enum: [ISSUED] }
+        customer: { $ref: '#/components/schemas/CustomerRef' }
+        source:
+          type: object
+          properties:
+            type: { type: string, enum: [RENTAL, CANCELLATION, EXPIRY, DAMAGE_ASSESSMENT, REPLACEMENT] }
+            id: { type: string }
+        currency: { type: string }
+        line_items: { type: array, items: { $ref: '#/components/schemas/LineItem' } }
+        total_minor: { type: integer }
+        issued_at: { type: string, format: date-time }
+        replaces_invoice_id: { type: string, nullable: true }
+        credit_notes: { type: array, readOnly: true, items: { $ref: '#/components/schemas/CreditNoteSummary' } }
+        net_amount_minor: { type: integer, readOnly: true }
+    InvoicePage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Invoice' } }
+        next_cursor: { type: string, nullable: true }
+    CreditNoteCreate:
+      type: object
+      required: [amount_minor, reason, settlement]
+      properties:
+        amount_minor: { type: integer, minimum: 1 }
+        line_item_id: { type: string }
+        reason: { type: string }
+        settlement: { type: string, enum: [REFUND_TO_PAYMENT_METHOD, ACCOUNT_CREDIT] }
+        replacement:
+          type: object
+          description: Optional replacement invoice when the original is fully credited
+          properties:
+            line_items: { type: array, items: { $ref: '#/components/schemas/LineItem' } }
+    CreditNote:
+      type: object
+      description: Immutable.
+      properties:
+        credit_note_id: { type: string }
+        credit_note_number: { type: string }
+        invoice_id: { type: string }
+        line_item_id: { type: string, nullable: true }
+        dispute_id: { type: string, nullable: true }
+        amount_minor: { type: integer }
+        currency: { type: string }
+        reason: { type: string }
+        settlement: { type: string, enum: [REFUND_TO_PAYMENT_METHOD, ACCOUNT_CREDIT] }
+        replacement_invoice_id: { type: string, nullable: true }
+        issued_by: { type: string }
+        issued_at: { type: string, format: date-time }
+
+    # ── disputes ──
+    DisputeCreate:
+      type: object
+      required: [invoice_id, line_item_id, disputed_amount_minor, reason_code, explanation]
+      properties:
+        invoice_id: { type: string }
+        line_item_id: { type: string }
+        disputed_amount_minor: { type: integer, minimum: 1 }
+        reason_code: { type: string, enum: [LATE_FEE_INCORRECT, DURATION_INCORRECT, EQUIPMENT_NOT_USED, DIFFERENT_HUB_FEE, DAMAGE_CHARGE, CANCELLATION_FEE, OTHER] }
+        explanation: { type: string, maxLength: 2000 }
+        attachment_ids: { type: array, items: { type: string } }
+    Dispute:
+      type: object
+      properties:
+        dispute_id: { type: string }
+        invoice_id: { type: string }
+        line_item_id: { type: string }
+        status: { $ref: '#/components/schemas/DisputeStatus' }
+        reason_code: { type: string }
+        explanation: { type: string }
+        disputed_amount_minor: { type: integer }
+        currency: { type: string }
+        attachment_ids: { type: array, items: { type: string } }
+        opened_by: { type: string }
+        opened_at: { type: string, format: date-time }
+        assigned_to: { type: string, nullable: true }
+        resolution:
+          type: object
+          nullable: true
+          properties:
+            decision: { type: string, enum: [ACCEPTED, PARTIALLY_ACCEPTED, REJECTED] }
+            credited_amount_minor: { type: integer }
+            credit_note_id: { type: string, nullable: true }
+            settlement: { type: string, nullable: true }
+            note: { type: string }
+            resolved_by: { type: string }
+            resolved_at: { type: string, format: date-time }
+    DisputePage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Dispute' } }
+        next_cursor: { type: string, nullable: true }
+    DisputeResolve:
+      type: object
+      required: [decision, note]
+      properties:
+        decision: { type: string, enum: [ACCEPTED, PARTIALLY_ACCEPTED, REJECTED] }
+        credit_amount_minor: { type: integer, minimum: 1, description: Required unless REJECTED }
+        settlement: { type: string, enum: [REFUND_TO_PAYMENT_METHOD, ACCOUNT_CREDIT] }
+        note: { type: string, maxLength: 2000 }
